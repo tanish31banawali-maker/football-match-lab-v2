@@ -234,7 +234,7 @@ def score_metrics(df):
 with st.sidebar:
     st.header('Settings')
     sims=st.select_slider('Simulations per match',options=[10000,25000,50000,75000,100000],value=50000)
-    seed=st.number_input('Random seed',min_value=1,max_value=9999999,value=20261111)
+    seed=st.number_input('Random seed',min_value=1,max_value=99999999,value=20261111)
     uncertainty=st.slider('Rate uncertainty',.05,.45,.18,.01)
     home_adv=st.slider('Home advantage multiplier',1.0,1.25,1.08,.01)
     st.divider(); st.subheader('Data provider')
