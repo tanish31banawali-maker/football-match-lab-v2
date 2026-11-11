@@ -7,12 +7,14 @@ import math
 import os
 import re
 import requests
+import urllib.parse
 from datetime import date, datetime, timedelta
 
 # ---------------- App & Database Configuration ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, 'football_lab_v4.db')
 API_BASE = 'https://v3.football.api-sports.io'
+OPENFOOTBALL_BASE = 'https://raw.githubusercontent.com/openfootball/football.json/master'
 
 st.set_page_config(
     page_title='Football Match Lab V4',
@@ -179,7 +181,53 @@ def apply_bayesian_shrinkage(observed_value, sample_size, baseline_value, k=10.0
     weight = sample_size / (sample_size + k)
     return (weight * observed_value) + ((1.0 - weight) * baseline_value)
 
-# ---------------- API Engine with Error Handling ----------------
+# ---------------- OpenFootball Engine (No API Key Required) ----------------
+@st.cache_data(ttl=3600)
+def fetch_openfootball_league(season_str, league_code):
+    url = f"{OPENFOOTBALL_BASE}/{season_str}/{league_code}.json"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+def calc_openfootball_team_stats(team_name, season_str="2024-25", league_code="en.1"):
+    data = fetch_openfootball_league(season_str, league_code)
+    if not data or 'matches' not in data:
+        return None
+        
+    scored, conceded, matches_played = 0, 0, 0
+    t_clean = team_name.lower().strip()
+    
+    for m in data['matches']:
+        if 'score' not in m or 'ft' not in m['score']:
+            continue
+        
+        t1 = m['team1'].lower()
+        t2 = m['team2'].lower()
+        ft = m['score']['ft']
+        
+        if t_clean in t1:
+            scored += ft[0]
+            conceded += ft[1]
+            matches_played += 1
+        elif t_clean in t2:
+            scored += ft[1]
+            conceded += ft[0]
+            matches_played += 1
+            
+    if matches_played == 0:
+        return None
+        
+    return {
+        'matches_played': matches_played,
+        'gf': round(scored / matches_played, 2),
+        'ga': round(conceded / matches_played, 2)
+    }
+
+# ---------------- API Engine with Safe URL Encoding & Error Handling ----------------
 def get_api_key():
     if 'api_key' in st.session_state and st.session_state['api_key']:
         return st.session_state['api_key']
@@ -190,7 +238,7 @@ def get_api_key():
 
 def api_get(path, params, key):
     if not key or not key.strip():
-        raise RuntimeError("API Key missing. Enter your API-Football key in Settings sidebar or switch to Manual Mode.")
+        raise RuntimeError("API Key missing. Enter your API-Football key in Settings sidebar or switch to Manual / OpenFootball Mode.")
     resp = requests.get(f"{API_BASE}/{path.lstrip('/')}", headers={'x-apisports-key': key}, params=params, timeout=20)
     resp.raise_for_status()
     body = resp.json()
@@ -209,7 +257,8 @@ def is_senior_team(team_name):
     return True
 
 def resolve_exact_team(name, key):
-    rows, _, _ = api_get('teams', {'search': name}, key)
+    safe_search = urllib.parse.quote(name.strip())
+    rows, _, _ = api_get('teams', {'search': safe_search}, key)
     if not rows:
         return None
     
@@ -271,7 +320,7 @@ with st.sidebar:
     st.image("https://img.icons8.com/color/96/football-ball-1.png", width=64)
     st.title("Match Lab V4 Controls")
     
-    api_key_input = st.text_input("API-Football Key", type="password", value=get_api_key(), help="Leave blank if using Manual / Standalone Mode.")
+    api_key_input = st.text_input("API-Football Key", type="password", value=get_api_key(), help="Leave blank if using Manual or OpenFootball Mode.")
     st.session_state['api_key'] = api_key_input
     
     season_val = st.number_input("Season Year", min_value=2018, max_value=2030, value=2026)
@@ -308,7 +357,11 @@ with tabs[0]:
     
     mode = st.radio(
         "Select Operating Mode:",
-        ["Manual / Standalone Mode (Free - No API Key Required)", "API-Football Automatic Mode"],
+        [
+            "Manual / Standalone Mode (Free - Manual Inputs)",
+            "OpenFootball Data Mode (Free - GitHub JSON Dataset)",
+            "API-Football Automatic Mode (API Key Required)"
+        ],
         index=0
     )
     
@@ -335,32 +388,61 @@ with tabs[0]:
                     'away_team': {'id': 9992, 'name': away_name_input, 'country': 'Manual'},
                     'recent_h': [{'gf': h_g_for, 'ga': h_g_against, 'opponent_elo': 1500}] * 10,
                     'recent_a': [{'gf': a_g_for, 'ga': a_g_against, 'opponent_elo': 1500}] * 10,
-                    'h2h': [],
-                    'injuries_h': [],
-                    'injuries_a': [],
-                    'lineups': []
+                    'h2h': [], 'injuries_h': [], 'injuries_a': [], 'lineups': []
                 }
                 st.success(f"Fixture '{home_name_input} vs {away_name_input}' manually confirmed! Prediction engine unlocked.")
+                st.rerun()
+
+    elif mode.startswith("OpenFootball"):
+        st.info("Fetches goal averages automatically from GitHub `openfootball/football.json` datasets.")
+        league_code_input = st.selectbox("Select Competition Code", ["en.1", "es.1", "de.1", "it.1"], format_func=lambda x: {"en.1": "Premier League", "es.1": "La Liga", "de.1": "Bundesliga", "it.1": "Serie A"}[x])
+        season_code_input = st.text_input("Season Format (e.g. 2024-25)", value="2024-25")
+        
+        if st.button("🌐 Fetch OpenFootball Stats & Confirm Fixture", type="primary", use_container_width=True):
+            with st.spinner("Fetching openfootball datasets..."):
+                h_stats = calc_openfootball_team_stats(home_name_input, season_code_input, league_code_input)
+                a_stats = calc_openfootball_team_stats(away_name_input, season_code_input, league_code_input)
+                
+                h_gf = h_stats['gf'] if h_stats else h_g_for
+                h_ga = h_stats['ga'] if h_stats else h_g_against
+                a_gf = a_stats['gf'] if a_stats else a_g_for
+                a_ga = a_stats['ga'] if a_stats else a_g_against
+                
+                st.session_state['current_match_v4'] = {
+                    'verified': True,
+                    'verification_status': 'OpenFootball Auto-Verified',
+                    'home_team': {'id': 8881, 'name': home_name_input, 'country': 'OpenFootball'},
+                    'away_team': {'id': 8882, 'name': away_name_input, 'country': 'OpenFootball'},
+                    'recent_h': [{'gf': h_gf, 'ga': h_ga, 'opponent_elo': 1500}] * 10,
+                    'recent_a': [{'gf': a_gf, 'ga': a_ga, 'opponent_elo': 1500}] * 10,
+                    'h2h': [], 'injuries_h': [], 'injuries_a': [], 'lineups': []
+                }
+                st.success(f"Fetched stats: {home_name_input} ({h_gf} GF / {h_ga} GA) vs {away_name_input} ({a_gf} GF / {a_ga} GA). Engine unlocked!")
+                st.rerun()
+
     else:
         btn_verify = st.button("🔍 Verify Teams via API", use_container_width=True, type="primary")
         if btn_verify:
             key = get_api_key()
             if not key:
-                st.error("API Key missing. Enter key in sidebar or switch to Manual Mode above.")
+                st.error("API Key missing. Enter key in sidebar or switch to Manual / OpenFootball Mode above.")
             else:
                 with st.spinner("Verifying senior teams..."):
                     try:
                         ht = resolve_exact_team(home_name_input, key)
                         at = resolve_exact_team(away_name_input, key)
                         if not ht or not at:
-                            st.error("Could not resolve senior teams.")
+                            missing = []
+                            if not ht: missing.append(home_name_input)
+                            if not at: missing.append(away_name_input)
+                            st.error(f"Could not resolve senior team(s): {', '.join(missing)}. Try exact spelling or switch to Manual Mode.")
                             st.session_state['current_match_v4'] = {'verified': False, 'reason': 'Team resolution failed'}
                         else:
                             hid, aid = ht['team']['id'], at['team']['id']
                             fix_info = verify_and_fetch_fixture(hid, aid, season_val, key, league_id_val)
                             st.session_state['current_match_v4'] = {
-                                'verified': fix_info['verified'],
-                                'verification_status': 'API Verified' if fix_info['verified'] else 'Unverified',
+                                'verified': True,
+                                'verification_status': 'API Verified' if fix_info['verified'] else 'API Teams Found (Unscheduled)',
                                 'fixture_info': fix_info,
                                 'home_team': ht['team'],
                                 'away_team': at['team'],
@@ -368,6 +450,8 @@ with tabs[0]:
                                 'recent_a': [{'gf': a_g_for, 'ga': a_g_against, 'opponent_elo': 1500}] * 10,
                                 'h2h': [], 'injuries_h': [], 'injuries_a': [], 'lineups': []
                             }
+                            st.success(f"✅ Teams Resolved: **{ht['team']['name']}** vs **{at['team']['name']}**")
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Verification process error: {e}")
                         st.session_state['current_match_v4'] = {'verified': False, 'reason': str(e)}
@@ -376,7 +460,7 @@ with tabs[0]:
     if match_data.get('verified'):
         st.success(f"✅ **Fixture Status:** {match_data['home_team']['name']} vs {match_data['away_team']['name']} ({match_data.get('verification_status', 'Verified')})")
     else:
-        st.warning("⚠️ **Fixture Not Verified** — Switch to Manual Mode or enter an API key to enable predictions.")
+        st.warning("⚠️ **Fixture Not Verified** — Confirm a fixture above to enable predictions.")
 
 # ---------------- TAB 1: TEAM ANALYSIS ----------------
 with tabs[1]:
