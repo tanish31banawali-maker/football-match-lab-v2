@@ -13,7 +13,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, 'football_lab_v4.db')
 
 st.set_page_config(
-    page_title='Football Match Lab V4.3',
+    page_title='Football Match Lab V4.4',
     page_icon='⚽',
     layout='wide',
     initial_sidebar_state='expanded'
@@ -57,22 +57,9 @@ FORMATION_PROFILES = {
 }
 
 def get_formation_multipliers(formation_name):
-    return FORMATION_PROFILES.get(formation_name, {"attack": 1.00, "defense": 1.00})
-
-def get_stored_elo(team_name, default=1500.0):
-    with db() as con:
-        cur = con.execute("SELECT rating FROM team_elo_ratings WHERE team_name = ?", (team_name,))
-        row = cur.fetchone()
-        return row['rating'] if row else default
-
-def update_stored_elo(team_name, new_rating):
-    with db() as con:
-        con.execute('''INSERT INTO team_elo_ratings (team_name, rating, last_updated)
-                       VALUES (?, ?, ?)
-                       ON CONFLICT(team_name) DO UPDATE SET
-                       rating = excluded.rating,
-                       last_updated = excluded.last_updated''',
-                    (team_name, float(new_rating), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    clean_f = re.search(r'\d-\d-\d(-\d)?', str(formation_name))
+    f_str = clean_f.group(0) if clean_f else "4-3-3"
+    return FORMATION_PROFILES.get(f_str, {"attack": 1.00, "defense": 1.00})
 
 # ---------------- Dixon-Coles & Monte Carlo Math Engine ----------------
 def poisson_pmf(lam, k):
@@ -148,111 +135,117 @@ def model_probabilities_from_samples(hg, ag):
         'scores': scores_df.sort_values('probability', ascending=False).head(10)
     }
 
-# ---------------- Multi-Section Text Parser ----------------
+# ---------------- Robust Multi-Section Text Parser ----------------
 def parse_single_block(text):
     data = {
-        'home_team': 'Italy', 'away_team': 'France',
-        'home_gf': 1.67, 'home_ga': 1.15, 'home_elo': 1840.0,
-        'away_gf': 2.10, 'away_ga': 0.75, 'away_elo': 1910.0,
-        'home_formation': '4-3-3', 'away_formation': '4-3-3',
+        'home_team': 'England', 'away_team': 'Croatia',
+        'home_gf': 3.50, 'home_ga': 0.75, 'home_elo': 1857.0,
+        'away_gf': 1.00, 'away_ga': 3.50, 'away_elo': 1702.0,
+        'home_formation': '4-2-3-1', 'away_formation': '4-2-3-1',
         'home_absences': [], 'away_absences': [],
-        'home_players': [], 'away_players': [],
         'h2h': [],
-        'odd_h': 2.75, 'odd_d': 3.20, 'odd_a': 2.45
+        'odd_h': 1.25, 'odd_d': 7.00, 'odd_a': 9.00
     }
     
     lines = [line.strip() for line in text.split('\n') if line.strip()]
-    current_section = None
     
+    # 1. Detect Teams dynamically
+    teams_found = []
+    for line in lines[:10]:
+        clean_l = line.strip('-* ').strip()
+        if len(clean_l) > 2 and not any(k in clean_l.lower() for k in ['avg', 'elo', 'goals', 'match', '1.', '2.', '3.', '4.', '5.']):
+            teams_found.append(clean_l)
+            if len(teams_found) == 2:
+                break
+    
+    if len(teams_found) >= 2:
+        data['home_team'], data['away_team'] = teams_found[0], teams_found[1]
+
+    # Context state tracking
+    active_team = data['home_team']
+    active_section = None
+
     for line in lines:
         l = line.lower()
-        
-        # Detect Team Names
-        if 'vs' in l and ('match:' in l or 'italy' in l or 'home' in l):
-            m = re.search(r'([a-zA-Z\s]+)\s+vs\s+([a-zA-Z\s]+)', line, re.I)
-            if m:
-                data['home_team'] = m.group(1).replace('Match:', '').strip()
-                data['away_team'] = m.group(2).strip()
 
-        # Parse Goal Averages
-        if 'home avg goals scored' in l or 'italy avg goals scored' in l or ('home' in l and 'gf:' in l):
-            val = re.findall(r'\d+\.\d+|\d+', line)
-            if val: data['home_gf'] = float(val[0])
-        if 'home avg goals conceded' in l or 'italy avg goals conceded' in l or ('home' in l and 'ga:' in l):
-            val = re.findall(r'\d+\.\d+|\d+', line)
-            if val: data['home_ga'] = float(val[0])
-        if 'away avg goals scored' in l or 'france avg goals scored' in l or ('away' in l and 'gf:' in l):
-            val = re.findall(r'\d+\.\d+|\d+', line)
-            if val: data['away_gf'] = float(val[0])
-        if 'away avg goals conceded' in l or 'france avg goals conceded' in l or ('away' in l and 'ga:' in l):
-            val = re.findall(r'\d+\.\d+|\d+', line)
-            if val: data['away_ga'] = float(val[0])
+        # Switch context team
+        if data['home_team'].lower() in l and not any(k in l for k in ['formation', 'absences', 'odds', 'starting']):
+            active_team = data['home_team']
+        elif data['away_team'].lower() in l and not any(k in l for k in ['formation', 'absences', 'odds', 'starting']):
+            active_team = data['away_team']
 
-        # Parse Elo Ratings
-        if ('home' in l or data['home_team'].lower() in l) and 'elo' in l:
+        # Parse GF / GA
+        if 'goals scored' in l or 'gf' in l:
+            val = re.findall(r'\d+\.\d+|\d+', line)
+            if val:
+                if active_team == data['home_team']: data['home_gf'] = float(val[0])
+                else: data['away_gf'] = float(val[0])
+
+        if 'goals conceded' in l or 'ga' in l:
+            val = re.findall(r'\d+\.\d+|\d+', line)
+            if val:
+                if active_team == data['home_team']: data['home_ga'] = float(val[0])
+                else: data['away_ga'] = float(val[0])
+
+        # Parse Elo
+        if 'elo' in l:
             val = re.findall(r'\d{4}', line)
-            if val: data['home_elo'] = float(val[0])
-        if ('away' in l or data['away_team'].lower() in l) and 'elo' in l:
-            val = re.findall(r'\d{4}', line)
-            if val: data['away_elo'] = float(val[0])
+            if val:
+                if active_team == data['home_team']: data['home_elo'] = float(val[0])
+                else: data['away_elo'] = float(val[0])
 
         # Parse Formations
-        if 'home formation:' in l or 'italy (formation:' in l:
+        if 'formation' in l:
             m = re.search(r'\d-\d-\d(-\d)?', line)
-            if m: data['home_formation'] = m.group(0)
-        if 'away formation:' in l or 'france (formation:' in l:
-            m = re.search(r'\d-\d-\d(-\d)?', line)
-            if m: data['away_formation'] = m.group(0)
+            if m:
+                if data['home_team'].lower() in l: data['home_formation'] = m.group(0)
+                elif data['away_team'].lower() in l: data['away_formation'] = m.group(0)
 
-        # Parse Bookmaker Odds
-        if 'home odds' in l or 'odds (1' in l:
-            val = re.findall(r'\d+\.\d+', line)
-            if val: data['odd_h'] = float(val[0])
-        if 'draw odds' in l or 'odds (x' in l:
-            val = re.findall(r'\d+\.\d+', line)
-            if val: data['odd_d'] = float(val[0])
-        if 'away odds' in l or 'odds (2' in l:
-            val = re.findall(r'\d+\.\d+', line)
-            if val: data['odd_a'] = float(val[0])
+        # Parse Odds
+        if 'odds (1' in l or 'home odds' in l or '1 - ' in l:
+            val = re.findall(r'\d+\.\d+|\d+', line)
+            if val: data['odd_h'] = float(val[-1])
+        if 'odds (x' in l or 'draw odds' in l or '(x)' in l:
+            val = re.findall(r'\d+\.\d+|\d+', line)
+            if val: data['odd_d'] = float(val[-1])
+        if 'odds (2' in l or 'away odds' in l or '2 - ' in l:
+            val = re.findall(r'\d+\.\d+|\d+', line)
+            if val: data['odd_a'] = float(val[-1])
 
-        # Detect List Sections
-        if 'home absences' in l or 'italy absences' in l:
-            current_section = 'home_absences'; continue
-        elif 'away absences' in l or 'france absences' in l:
-            current_section = 'away_absences'; continue
-        elif 'head-to-head' in l or 'h2h' in l:
-            current_section = 'h2h'; continue
-        elif 'player impact' in l or 'player ratings' in l:
-            current_section = 'players'; continue
+        # Section Tracking for Absences and H2H
+        if 'absences' in l or 'injuries' in l:
+            if data['home_team'].lower() in l: active_section = 'home_absences'
+            else: active_section = 'away_absences'
+            continue
+        elif 'h2h' in l or 'head-to-head' in l:
+            active_section = 'h2h'
+            continue
 
-        # Parse Bullet Items into Active Section
-        if current_section == 'home_absences' and (line.startswith('*') or line.startswith('-')):
-            data['home_absences'].append(line.strip('* -'))
-        elif current_section == 'away_absences' and (line.startswith('*') or line.startswith('-')):
-            data['away_absences'].append(line.strip('* -'))
-        elif current_section == 'h2h' and (line.startswith('*') or line.startswith('-') or '|' in line):
-            if 'Date' not in line and '---' not in line:
-                data['h2h'].append(line.strip('* -'))
+        if active_section == 'home_absences' and (line.startswith('-') or line.startswith('*')):
+            data['home_absences'].append(line.strip('-* '))
+        elif active_section == 'away_absences' and (line.startswith('-') or line.startswith('*')):
+            data['away_absences'].append(line.strip('-* '))
+        elif active_section == 'h2h' and (line.startswith('-') or line.startswith('*') or re.search(r'\d{2}\s+[a-zA-Z]{3}', line)):
+            data['h2h'].append(line.strip('-* '))
 
     return data
 
 # ---------------- Sidebar Controls ----------------
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/football-ball-1.png", width=64)
-    st.title("Match Lab V4.3 Controls")
+    st.title("Match Lab V4.4")
     sim_count = st.select_slider("Simulation Runs", options=[10000, 50000, 100000], value=50000)
     home_adv_val = st.slider("Home Advantage Multiplier", 1.00, 1.25, 1.08, 0.01)
     dixon_coles_rho = st.slider("Dixon-Coles Rho", -0.30, 0.00, -0.13, 0.01)
 
 # ---------------- App Header & Tabs ----------------
-st.title("⚽ Football Match Lab V4.3 — Unified Engine")
+st.title("⚽ Football Match Lab V4.4 — Robust Parser")
 
 tabs = st.tabs([
     "📋 Text Block Parser",
     "🛡️ Team & Elo Analysis",
     "📈 Recent Form",
     "⚔️ Head-to-Head",
-    "👤 Player Analysis",
     "🏥 Squad Absences",
     "📋 Lineups & Tactics",
     "🎲 Prediction Engine",
@@ -262,68 +255,33 @@ tabs = st.tabs([
 # ---------------- TAB 0: PARSER ----------------
 with tabs[0]:
     st.subheader("Paste Complete Match Block")
-    st.write("Paste your raw match details text below. Clicking parse will auto-fill every tab in the app and power the simulation engine:")
+    st.write("Paste your raw match text below and click Parse:")
     
-    default_block = """Match: Italy vs France
-Italy Avg Goals Scored (GF): 1.67
-Italy Avg Goals Conceded (GA): 1.15
-Italy Team Elo Rating: 1840
-
-France Avg Goals Scored (GF): 2.10
-France Avg Goals Conceded (GA): 0.75
-France Team Elo Rating: 1910
-
-Italy Formation: 4-3-3
-France Formation: 4-3-3
-
-Italy Absences:
-* Giovanni Di Lorenzo (Defender) - Muscle Injury
-* Gianluca Mancini (Defender) - Withdrew
-* Moise Kean (Forward) - Ankle Strain
-* Giacomo Raspadori (Forward) - Thigh Strain
-
-France Absences:
-* Ousmane Dembélé (Forward) - Thigh Strain
-* William Saliba (Defender) - Hamstring Injury
-* Jules Koundé (Defender) - Muscle Fatigue
-* Aurélien Tchouaméni (Midfielder) - Suspended
-* Marcus Thuram (Forward) - Knee Injury
-
-Head-to-Head History:
-* 03 Oct 2026: France 1-1 Italy
-* 17 Nov 2024: Italy 1-3 France
-* 06 Sep 2024: France 1-3 Italy
-
-Bookmaker Home Odds (1 - Italy): 2.75
-Bookmaker Draw Odds (X): 3.20
-Bookmaker Away Odds (2 - France): 2.45"""
-
-    raw_text = st.text_area("Match Block Text", value=default_block, height=350)
+    raw_text = st.text_area("Match Block Text", value="", height=350, placeholder="Paste England vs Croatia or any other match block here...")
     
     if st.button("🚀 Parse & Populate Match Engine", type="primary", use_container_width=True):
-        parsed_data = parse_single_block(raw_text)
-        st.session_state['parsed_match_v43'] = parsed_data
-        st.success(f"Loaded match parameters for **{parsed_data['home_team']} vs {parsed_data['away_team']}**!")
+        if not raw_text.strip():
+            st.error("Please paste text into the box before parsing.")
+        else:
+            parsed_data = parse_single_block(raw_text)
+            st.session_state['parsed_match_v44'] = parsed_data
+            st.success(f"Loaded match parameters for **{parsed_data['home_team']} vs {parsed_data['away_team']}**!")
 
-# ---------------- TAB 1: ELO ANALYSIS ----------------
+# ---------------- TAB 1: ELO ----------------
 with tabs[1]:
-    st.subheader("Team Identity & Dynamic Elo Ratings")
-    data = st.session_state.get('parsed_match_v43')
+    st.subheader("Team Identity & Elo Ratings")
+    data = st.session_state.get('parsed_match_v44')
     if not data:
         st.warning("Please parse a match block in Tab 0 first.")
     else:
         c1, c2 = st.columns(2)
-        with c1:
-            st.markdown(f"### 🏠 {data['home_team']}")
-            st.metric("Parsed Elo Rating", f"{data['home_elo']:.1f}")
-        with c2:
-            st.markdown(f"### ✈️ {data['away_team']}")
-            st.metric("Parsed Elo Rating", f"{data['away_elo']:.1f}")
+        c1.metric(f"🏠 {data['home_team']} Elo", f"{data['home_elo']:.1f}")
+        c2.metric(f"✈️ {data['away_team']} Elo", f"{data['away_elo']:.1f}")
 
 # ---------------- TAB 2: RECENT FORM ----------------
 with tabs[2]:
     st.subheader("📈 Base Goal Averages")
-    data = st.session_state.get('parsed_match_v43')
+    data = st.session_state.get('parsed_match_v44')
     if not data:
         st.warning("Please parse a match block in Tab 0 first.")
     else:
@@ -336,24 +294,16 @@ with tabs[2]:
 # ---------------- TAB 3: H2H ----------------
 with tabs[3]:
     st.subheader("⚔️ Head-to-Head Encounters")
-    data = st.session_state.get('parsed_match_v43')
+    data = st.session_state.get('parsed_match_v44')
     if not data or not data.get('h2h'):
-        st.info("No H2H lines parsed or available.")
+        st.info("No H2H lines parsed.")
     else:
         st.dataframe(pd.DataFrame(data['h2h'], columns=["Match Event"]), use_container_width=True)
 
-# ---------------- TAB 4: PLAYER ANALYSIS ----------------
+# ---------------- TAB 4: ABSENCES ----------------
 with tabs[4]:
-    st.subheader("👤 Key Player Impact")
-    st.dataframe(pd.DataFrame([
-        {"Team": "Italy", "Player": "Nicolò Barella", "Pos": "MF", "Rating": 8.1, "xG_90": 0.32},
-        {"Team": "France", "Player": "Kylian Mbappé", "Pos": "FW", "Rating": 8.6, "xG_90": 0.78}
-    ]), hide_index=True, use_container_width=True)
-
-# ---------------- TAB 5: ABSENCES ----------------
-with tabs[5]:
     st.subheader("🏥 Confirmed Squad Absences")
-    data = st.session_state.get('parsed_match_v43')
+    data = st.session_state.get('parsed_match_v44')
     if not data:
         st.warning("Please parse a match block in Tab 0 first.")
     else:
@@ -365,10 +315,10 @@ with tabs[5]:
             st.markdown(f"#### ✈️ {data['away_team']} Absences ({len(data['away_absences'])})")
             for a in data['away_absences']: st.write(f"- {a}")
 
-# ---------------- TAB 6: LINEUPS & TACTICS ----------------
-with tabs[6]:
+# ---------------- TAB 5: LINEUPS ----------------
+with tabs[5]:
     st.subheader("📋 Tactical Formations")
-    data = st.session_state.get('parsed_match_v43')
+    data = st.session_state.get('parsed_match_v44')
     if not data:
         st.warning("Please parse a match block in Tab 0 first.")
     else:
@@ -376,29 +326,25 @@ with tabs[6]:
         c1.metric(f"🏠 {data['home_team']} Structure", data['home_formation'])
         c2.metric(f"✈️ {data['away_team']} Structure", data['away_formation'])
 
-# ---------------- TAB 7: PREDICTION ENGINE ----------------
-with tabs[7]:
+# ---------------- TAB 6: PREDICTION ENGINE ----------------
+with tabs[6]:
     st.subheader("🎲 Monte Carlo Poisson Simulation Engine")
-    data = st.session_state.get('parsed_match_v43')
+    data = st.session_state.get('parsed_match_v44')
     
     if not data:
         st.error("Please parse match block in Tab 0 to run simulation.")
     else:
         if st.button("⚡ Run Monte Carlo Engine on Parsed Data", type="primary", use_container_width=True):
-            # Calculate Elo relative rating adjustment
             elo_diff = data['home_elo'] - data['away_elo']
             adj_h_mult = max(0.5, min(2.0, 10.0 ** (elo_diff / 600.0)))
             adj_a_mult = max(0.5, min(2.0, 10.0 ** (-elo_diff / 600.0)))
 
-            # Get Formation shape profiles
             h_prof = get_formation_multipliers(data['home_formation'])
             a_prof = get_formation_multipliers(data['away_formation'])
 
-            # Absence Multipliers (-7% per missing player)
             h_abs_mult = max(0.60, 1.0 - (len(data['home_absences']) * 0.07))
             a_abs_mult = max(0.60, 1.0 - (len(data['away_absences']) * 0.07))
 
-            # Calculate Expected Goals ($\lambda$ & $\mu$)
             lambda_h = (0.6 * data['home_gf'] + 0.4 * data['away_ga']) * adj_h_mult * h_prof['attack'] * a_prof['defense'] * h_abs_mult
             mu_a = (0.6 * data['away_gf'] + 0.4 * data['home_ga']) * adj_a_mult * a_prof['attack'] * h_prof['defense'] * a_abs_mult
 
@@ -407,7 +353,7 @@ with tabs[7]:
             )
 
             res = model_probabilities_from_samples(hg, ag)
-            st.session_state['active_res_v43'] = res
+            st.session_state['active_res_v44'] = res
 
             st.success("Simulation Completed!")
 
@@ -424,14 +370,14 @@ with tabs[7]:
 
             st.markdown(f"**Expected Goals:** {data['home_team']} **{res['exp_home']:.2f}** — **{res['exp_away']:.2f}** {data['away_team']}")
 
-# ---------------- TAB 8: MARKET ODDS ----------------
-with tabs[8]:
+# ---------------- TAB 7: MARKET ODDS ----------------
+with tabs[7]:
     st.subheader("Market Odds & Value Comparison")
-    data = st.session_state.get('parsed_match_v43')
-    res = st.session_state.get('active_res_v43')
+    data = st.session_state.get('parsed_match_v44')
+    res = st.session_state.get('active_res_v44')
 
     if not data or not res:
-        st.info("Run simulation in Tab 7 to view market value calculation.")
+        st.info("Run simulation in Tab 6 to view market value calculation.")
     else:
         raw_h, raw_d, raw_a = 1.0 / data['odd_h'], 1.0 / data['odd_d'], 1.0 / data['odd_a']
         total_imp = raw_h + raw_d + raw_a
