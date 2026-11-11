@@ -163,6 +163,19 @@ def model_probabilities_from_samples(hg, ag):
         'scores': scores_df.sort_values('probability', ascending=False).head(10)
     }
 
+# ---------------- Tactical Formation Impact Engine ----------------
+FORMATION_PROFILES = {
+    "4-3-3": {"attack": 1.05, "defense": 1.00},
+    "4-2-3-1": {"attack": 1.02, "defense": 1.02},
+    "3-5-2": {"attack": 1.04, "defense": 0.96},
+    "4-4-2": {"attack": 0.98, "defense": 1.03},
+    "3-4-2-1": {"attack": 1.06, "defense": 0.97},
+    "5-3-2": {"attack": 0.90, "defense": 1.12}
+}
+
+def get_formation_multipliers(formation_name):
+    return FORMATION_PROFILES.get(formation_name, {"attack": 1.00, "defense": 1.00})
+
 # ---------------- Elo & Shrinkage Engine ----------------
 DEFAULT_ELO = 1500.0
 
@@ -529,12 +542,14 @@ with tabs[4]:
         st.warning("Please confirm a fixture in Match Builder first.")
     else:
         st.write("Track standout players and key statistical metrics for this fixture:")
-        p_df = pd.DataFrame([
+        p_df = pd.DataFrame(match_data.get('player_impact', [
             {"Team": match_data['home_team']['name'], "Player Name": "Key Striker", "Position": "FW", "Rating": 8.2, "xG per 90": 0.65},
             {"Team": match_data['away_team']['name'], "Player Name": "Playmaker", "Position": "MF", "Rating": 7.9, "xG per 90": 0.42}
-        ])
-        edited_p = st.data_editor(p_df, num_rows="dynamic", use_container_width=True)
+        ]))
+        edited_p = st.data_editor(p_df, num_rows="dynamic", key="player_impact_editor", use_container_width=True)
         if st.button("💾 Save Key Player Impact"):
+            match_data['player_impact'] = edited_p.to_dict(orient="records")
+            st.session_state['current_match_v4'] = match_data
             st.success("Player impact ratings saved for model adjustment.")
 
 # ---------------- TAB 5: INJURIES & SQUAD ----------------
@@ -562,12 +577,12 @@ with tabs[5]:
 
 # ---------------- TAB 6: CONFIRMED LINEUPS ----------------
 with tabs[6]:
-    st.subheader("📋 Match Lineup Builder & Field Manager")
+    st.subheader("📋 Match Lineup Builder & Tactical Formations")
     match_data = st.session_state.get('current_match_v4', {})
     if not match_data.get('verified'):
         st.warning("Please confirm a fixture in Match Builder first.")
     else:
-        st.write("Enter or paste starting XIs and tactical formations for both teams:")
+        st.write("Enter or paste starting XIs and select tactical formations for both teams:")
         
         # Presets generator
         preset_cols = st.columns(3)
@@ -602,7 +617,7 @@ with tabs[6]:
             st.markdown(f"### 🏠 {match_data['home_team']['name']}")
             h_form = st.selectbox("Home Formation", ["4-3-3", "4-2-3-1", "3-5-2", "4-4-2", "3-4-2-1", "5-3-2"], key="h_formation")
             h_starting = st.text_area(
-                "Home Starting XI (One player per line or comma separated)", 
+                "Home Starting XI", 
                 value=st.session_state.get('h_lineup_text', "Raya\nWhite\nSaliba\nGabriel\nCalafiori\nOdegaard\nPartey\nRice\nSaka\nHavertz\nMartinelli"),
                 height=220,
                 key="h_lineup_input"
@@ -614,7 +629,7 @@ with tabs[6]:
             st.markdown(f"### ✈️ {match_data['away_team']['name']}")
             a_form = st.selectbox("Away Formation", ["4-2-3-1", "4-3-3", "3-5-2", "4-4-2", "3-4-2-1", "5-3-2"], key="a_formation")
             a_starting = st.text_area(
-                "Away Starting XI (One player per line or comma separated)", 
+                "Away Starting XI", 
                 value=st.session_state.get('a_lineup_text', "Sanchez\nJames\nFofana\nColwill\nCucurella\nCaicedo\nEnzo\nPalmer\nMadueke\nJackson\nNeto"),
                 height=220,
                 key="a_lineup_input"
@@ -623,7 +638,7 @@ with tabs[6]:
             a_manager = st.text_input("Away Manager", value="Enzo Maresca", key="a_mgr")
 
         st.divider()
-        if st.button("✅ Confirm Lineups & Tactical Structures", type="primary", use_container_width=True):
+        if st.button("✅ Confirm Lineups & Tactical Formations", type="primary", use_container_width=True):
             h_list = [p.strip() for p in h_starting.replace('\n', ',').split(',') if p.strip()]
             a_list = [p.strip() for p in a_starting.replace('\n', ',').split(',') if p.strip()]
             
@@ -635,23 +650,7 @@ with tabs[6]:
             
             match_data['lineups'] = lineup_payload
             st.session_state['current_match_v4'] = match_data
-            st.success("Lineups updated and confirmed! You can view tactical comparisons in Tab 7.")
-
-        # Lineup Overview Display
-        if match_data.get('lineups') and isinstance(match_data['lineups'], dict) and 'home' in match_data['lineups']:
-            st.subheader("📋 Confirmed Lineup Sheet")
-            l_data = match_data['lineups']
-            display_c1, display_c2 = st.columns(2)
-            
-            with display_c1:
-                st.markdown(f"**{match_data['home_team']['name']} ({l_data['home']['formation']})**")
-                st.caption(f"Manager: {l_data['home']['manager']}")
-                st.dataframe(pd.DataFrame(l_data['home']['starting'], columns=["Starting XI"]), use_container_width=True)
-                
-            with display_c2:
-                st.markdown(f"**{match_data['away_team']['name']} ({l_data['away']['formation']})**")
-                st.caption(f"Manager: {l_data['away']['manager']}")
-                st.dataframe(pd.DataFrame(l_data['away']['starting'], columns=["Starting XI"]), use_container_width=True)
+            st.success("Lineups and tactical formations confirmed!")
 
 # ---------------- TAB 7: TACTICAL OVERVIEW ----------------
 with tabs[7]:
@@ -665,12 +664,18 @@ with tabs[7]:
         a_form = lineup_data.get('away', {}).get('formation', '4-2-3-1') if isinstance(lineup_data, dict) else '4-2-3-1'
         
         c1, c2 = st.columns(2)
-        c1.metric(f"🏠 {match_data['home_team']['name']} Structure", h_form)
-        c2.metric(f"✈️ {match_data['away_team']['name']} Structure", a_form)
+        c1.metric(f"🏠 {match_data['home_team']['name']} Formation", h_form)
+        c2.metric(f"✈️ {match_data['away_team']['name']} Formation", a_form)
         
-        st.markdown("### Tactical Matchup Breakdown")
-        st.write(f"- **Midfield Control:** {h_form} vs {a_form} shape battle.")
-        st.write("- **Pressing Intensity:** High-line defensive adjustment enabled.")
+        h_prof = get_formation_multipliers(h_form)
+        a_prof = get_formation_multipliers(a_form)
+        
+        st.markdown("### Tactical Advantage Matrix")
+        tac_df = pd.DataFrame([
+            {"Team": match_data['home_team']['name'], "Shape": h_form, "Offensive Index": f"{h_prof['attack']:.2f}x", "Defensive Stability": f"{h_prof['defense']:.2f}x"},
+            {"Team": match_data['away_team']['name'], "Shape": a_form, "Offensive Index": f"{a_prof['attack']:.2f}x", "Defensive Stability": f"{a_prof['defense']:.2f}x"}
+        ])
+        st.dataframe(tac_df, hide_index=True, use_container_width=True)
 
 # ---------------- TAB 8: PREDICTION ENGINE ----------------
 with tabs[8]:
@@ -697,9 +702,24 @@ with tabs[8]:
             
             adj_h_mult = calculate_elo_adjustment(elo_h, elo_a, is_home=True)
             adj_a_mult = calculate_elo_adjustment(elo_a, elo_h, is_home=False)
+
+            # ---------------- Tactical Formation & Squad Absences Adjustments ----------------
+            lineups = match_data.get('lineups', {})
+            h_form = lineups.get('home', {}).get('formation', '4-3-3') if isinstance(lineups, dict) else '4-3-3'
+            a_form = lineups.get('away', {}).get('formation', '4-2-3-1') if isinstance(lineups, dict) else '4-2-3-1'
             
-            lambda_h = (0.6 * h_for_shrunk + 0.4 * raw_a_against) * adj_h_mult
-            mu_a = (0.6 * a_for_shrunk + 0.4 * raw_h_against) * adj_a_mult
+            h_prof = get_formation_multipliers(h_form)
+            a_prof = get_formation_multipliers(a_form)
+            
+            # Absence Penalty (-7% per confirmed absence)
+            inj_h = match_data.get('injuries_h', [])
+            inj_a = match_data.get('injuries_a', [])
+            h_absence_mult = clamp(1.0 - (len(inj_h) * 0.07), 0.60, 1.0)
+            a_absence_mult = clamp(1.0 - (len(inj_a) * 0.07), 0.60, 1.0)
+
+            # Expected Goal Multipliers
+            lambda_h = (0.6 * h_for_shrunk + 0.4 * raw_a_against) * adj_h_mult * h_prof['attack'] * a_prof['defense'] * h_absence_mult
+            mu_a = (0.6 * a_for_shrunk + 0.4 * raw_h_against) * adj_a_mult * a_prof['attack'] * h_prof['defense'] * a_absence_mult
             
             hg, ag = simulate_dixon_coles_monte_carlo(
                 lambda_h, mu_a, n=sim_count, seed=20261111, rho=dixon_coles_rho, home_adv=home_adv_val
