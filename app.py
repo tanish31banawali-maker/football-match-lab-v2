@@ -6,17 +6,16 @@ import json
 import math
 import os
 import re
-import urllib.parse
 import requests
 from datetime import datetime
 
 # ---------------- App & Database Configuration ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(APP_DIR, 'football_lab_v5_1.db')
+DB_PATH = os.path.join(APP_DIR, 'football_lab_v5_2.db')
 API_BASE = 'https://v3.football.api-sports.io'
 
 st.set_page_config(
-    page_title='Football Match Lab V5.1',
+    page_title='Football Match Lab V5.2',
     page_icon='⚽',
     layout='wide',
     initial_sidebar_state='expanded'
@@ -72,7 +71,6 @@ def compute_score_matrix(lh, ma, rho=-0.13, home_adv=1.08, unc=0.15, n=2500, see
     pm = lambda lam: np.exp(-lam[:, None] + G * np.log(lam[:, None]) - LG)
     M = pm(lh_s)[:, :, None] * pm(ma_s)[:, None, :]
 
-    # Dixon-Coles low-score correlation adjustments
     M[:, 0, 0] *= np.maximum(1e-4, 1.0 - lh_s * ma_s * rho)
     M[:, 0, 1] *= np.maximum(1e-4, 1.0 + lh_s * rho)
     M[:, 1, 0] *= np.maximum(1e-4, 1.0 + ma_s * rho)
@@ -82,7 +80,6 @@ def compute_score_matrix(lh, ma, rho=-0.13, home_adv=1.08, unc=0.15, n=2500, see
     return M.mean(axis=0)
 
 def extract_markets(M):
-    """Extracts 1X2, totals, BTTS, expected goals, and top scorelines directly from the probability matrix."""
     T = G[:, None] + G[None, :]
     p_home = float(np.tril(M, -1).sum())
     p_draw = float(np.trace(M))
@@ -110,8 +107,7 @@ def extract_markets(M):
         'p_btts': float(M[1:, 1:].sum()),
         'exp_home': exp_home,
         'exp_away': exp_away,
-        'scores': scores_df,
-        'matrix': M
+        'scores': scores_df
     }
 
 # ---------------- Calibrated Strength & Role-Based Absence Model ----------------
@@ -120,10 +116,6 @@ def shrink_rate(obs_rate, sample_size, baseline=1.35, k=8.0):
     return w * obs_rate + (1.0 - w) * baseline
 
 def calculate_expected_goals(data, elo_weight=0.35):
-    """
-    Combines Bayesian-shrunk, opponent-adjusted goal averages with a calibrated Elo blend
-    and role-based injury adjustments (attackers cut own xG; defenders/GK raise opponent xG).
-    """
     h = data['home']
     a = data['away']
 
@@ -132,7 +124,6 @@ def calculate_expected_goals(data, elo_weight=0.35):
     a_gf_s = shrink_rate(a['gf'], a.get('sample_size', 6))
     a_ga_s = shrink_rate(a['ga'], a.get('sample_size', 6))
 
-    # Opponent strength adjustment on recent schedule
     h_opp_fac = 10.0 ** ((h.get('avg_opp_elo', 1750.0) - 1750.0) / 1000.0)
     a_opp_fac = 10.0 ** ((a.get('avg_opp_elo', 1750.0) - 1750.0) / 1000.0)
 
@@ -144,7 +135,6 @@ def calculate_expected_goals(data, elo_weight=0.35):
     base_lh = 0.55 * h_gf_adj + 0.45 * a_ga_adj
     base_ma = 0.55 * a_gf_adj + 0.45 * h_ga_adj
 
-    # Calibrated Elo multiplier (divisor 1200 blended via elo_weight to avoid double-counting)
     elo_diff = h['elo'] - a['elo']
     raw_elo_h = 10.0 ** (elo_diff / 1200.0)
     raw_elo_a = 10.0 ** (-elo_diff / 1200.0)
@@ -155,7 +145,6 @@ def calculate_expected_goals(data, elo_weight=0.35):
     lh = base_lh * elo_mult_h
     ma = base_ma * elo_mult_a
 
-    # Role-based & importance-weighted absence impact
     imp_weights = {'star': 0.06, 'starter': 0.035, 'rotation': 0.015}
 
     def calc_absence_effects(absences):
@@ -180,11 +169,10 @@ def calculate_expected_goals(data, elo_weight=0.35):
 
     return round(lh, 3), round(ma, 3)
 
-# ---------------- Strict Validation & Parsers (No Silent Defaults) ----------------
+# ---------------- Strict Validation & One-Paste Parsers ----------------
 def validate_match_payload(data):
-    """Strictly validates a match payload; never substitutes silent defaults."""
     if not isinstance(data, dict):
-        return None, ["Payload must be a valid dictionary/JSON object."]
+        return None, ["Input must be a valid match dictionary."]
 
     errors = []
     for side in ('home', 'away'):
@@ -193,15 +181,15 @@ def validate_match_payload(data):
             continue
         team_obj = data[side]
         if not team_obj.get('name') or not str(team_obj['name']).strip():
-            errors.append(f"Missing '{side}.name'.")
+            errors.append(f"Missing '{side}' team name.")
         for num_field in ('gf', 'ga', 'elo'):
             val = team_obj.get(num_field)
             if val is None or isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
-                errors.append(f"Missing or invalid numeric '{side}.{num_field}'.")
+                errors.append(f"Missing or invalid numeric '{side} {num_field}' (must be a real number, not 'Unverified').")
             elif num_field == 'elo' and not (800 <= val <= 2600):
-                errors.append(f"'{side}.elo' ({val}) out of realistic bounds (800–2600).")
+                errors.append(f"'{side} elo' ({val}) out of realistic bounds (800–2600).")
             elif num_field in ('gf', 'ga') and val < 0:
-                errors.append(f"'{side}.{num_field}' cannot be negative.")
+                errors.append(f"'{side} {num_field}' cannot be negative.")
 
     if 'odds' not in data or not isinstance(data['odds'], dict):
         errors.append("Missing 'odds' section.")
@@ -222,12 +210,50 @@ def parse_number_after_colon(line):
     m = re.search(r'^-?\d+(?:\.\d+)?', after)
     return float(m.group(0)) if m else None
 
-def parse_structured_text_block(raw_text):
+def parse_absences_list(after_colon_str):
+    """Parses comma-separated absences like: Saliba (DEF, star), Mbappe (FWD, star)"""
+    text = after_colon_str.strip()
+    if not text or text.lower() in ('none', 'nil', '0', 'no'):
+        return []
+    items = [x.strip() for x in text.split(',') if x.strip()]
+    parsed = []
+    # Recombine if commas were inside parentheses like "Saliba (DEF, star)"
+    merged = []
+    buf = ""
+    for part in items:
+        buf = f"{buf}, {part}" if buf else part
+        if buf.count('(') == buf.count(')'):
+            merged.append(buf)
+            buf = ""
+    if buf:
+        merged.append(buf)
+
+    for entry in merged:
+        pos = 'MID'
+        if re.search(r'\b(fwd|forward|striker|st|att)\b', entry, re.I):
+            pos = 'FWD'
+        elif re.search(r'\b(def|defender|gk|goalkeeper)\b', entry, re.I):
+            pos = 'DEF'
+        imp = 'starter'
+        if re.search(r'\bstar\b', entry, re.I):
+            imp = 'star'
+        elif re.search(r'\b(rotation|sub|bench|reserve)\b', entry, re.I):
+            imp = 'rotation'
+        name = re.split(r'\(|–|-', entry)[0].strip()
+        if name:
+            parsed.append({'player': name, 'position': pos, 'importance': imp})
+    return parsed
+
+def parse_one_paste_input(raw_text):
     """
-    Strict parser for sectioned match blocks. Starts every field as None,
-    reads strictly after colons, uses word boundaries, and resets sections cleanly.
+    Supports both clean JSON and the simple 12-line Key: Value text block.
+    Reads strictly after colons with word boundaries. Never uses silent defaults.
     """
     text = raw_text.strip()
+    # Strip markdown code fences if user pasted ```json ... ```
+    text = re.sub(r'^```[a-zA-Z]*\s*', '', text)
+    text = re.sub(r'\s*```$', '', text).strip()
+
     if text.startswith('{'):
         try:
             obj = json.loads(text)
@@ -238,107 +264,60 @@ def parse_structured_text_block(raw_text):
     payload = {
         'home': {'name': None, 'gf': None, 'ga': None, 'elo': None, 'sample_size': 6, 'avg_opp_elo': 1750.0, 'absences': []},
         'away': {'name': None, 'gf': None, 'ga': None, 'elo': None, 'sample_size': 6, 'avg_opp_elo': 1750.0, 'absences': []},
-        'odds': {'home': None, 'draw': None, 'away': None},
-        'h2h': []
+        'odds': {'home': None, 'draw': None, 'away': None}
     }
 
-    section = None
-    active_side = None
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-    for ln in lines:
-        low = ln.lower()
-
-        # Reset section headers explicitly
-        if re.match(r'^(1\.|2\.|3\.|4\.|5\.|6\.)', low) or low.startswith('---'):
-            section = None
-            active_side = None
-            if 'base goal' in low or 'performance' in low or 'ratings' in low:
-                section = 'stats'
-            elif 'lineup' in low or 'formation' in low:
-                section = 'lineups'
-            elif 'absence' in low or 'injur' in low:
-                section = 'absences'
-            elif 'head-to-head' in low or re.search(r'\bh2h\b', low):
-                section = 'h2h'
-            elif 'odds' in low or 'market' in low:
-                section = 'odds'
+    for raw_ln in text.splitlines():
+        ln = raw_ln.strip().lstrip('-* ').strip()
+        if ':' not in ln:
             continue
+        key_part, val_part = ln.split(':', 1)
+        k = key_part.lower().strip()
+        v = val_part.strip()
 
-        # Explicit team declarations
-        if re.match(r'^home\s*team\s*:', low):
-            payload['home']['name'] = ln.split(':', 1)[1].strip()
-            active_side = 'home'
-            continue
-        if re.match(r'^away\s*team\s*:', low):
-            payload['away']['name'] = ln.split(':', 1)[1].strip()
-            active_side = 'away'
-            continue
+        # Home fields
+        if re.fullmatch(r'home\s*team', k):
+            payload['home']['name'] = v
+        elif re.fullmatch(r'home\s*gf', k):
+            payload['home']['gf'] = parse_number_after_colon(ln)
+        elif re.fullmatch(r'home\s*ga', k):
+            payload['home']['ga'] = parse_number_after_colon(ln)
+        elif re.fullmatch(r'home\s*elo', k):
+            payload['home']['elo'] = parse_number_after_colon(ln)
+        elif re.fullmatch(r'home\s*sample', k):
+            num = parse_number_after_colon(ln)
+            if num: payload['home']['sample_size'] = int(num)
+        elif re.fullmatch(r'home\s*opp\s*elo', k):
+            num = parse_number_after_colon(ln)
+            if num: payload['home']['avg_opp_elo'] = num
+        elif re.fullmatch(r'home\s*absences', k):
+            payload['home']['absences'] = parse_absences_list(v)
 
-        # Detect standalone team subheaders inside stats or absences
-        if ':' not in ln and not ln.startswith(('-', '*')) and section in ('stats', 'absences', None):
-            cand = ln.strip()
-            if payload['home']['name'] is None:
-                payload['home']['name'] = cand
-                active_side = 'home'
-                continue
-            elif payload['away']['name'] is None and cand.lower() != payload['home']['name'].lower():
-                payload['away']['name'] = cand
-                active_side = 'away'
-                continue
-            elif payload['home']['name'] and cand.lower() == payload['home']['name'].lower():
-                active_side = 'home'
-                continue
-            elif payload['away']['name'] and cand.lower() == payload['away']['name'].lower():
-                active_side = 'away'
-                continue
+        # Away fields
+        elif re.fullmatch(r'away\s*team', k):
+            payload['away']['name'] = v
+        elif re.fullmatch(r'away\s*gf', k):
+            payload['away']['gf'] = parse_number_after_colon(ln)
+        elif re.fullmatch(r'away\s*ga', k):
+            payload['away']['ga'] = parse_number_after_colon(ln)
+        elif re.fullmatch(r'away\s*elo', k):
+            payload['away']['elo'] = parse_number_after_colon(ln)
+        elif re.fullmatch(r'away\s*sample', k):
+            num = parse_number_after_colon(ln)
+            if num: payload['away']['sample_size'] = int(num)
+        elif re.fullmatch(r'away\s*opp\s*elo', k):
+            num = parse_number_after_colon(ln)
+            if num: payload['away']['avg_opp_elo'] = num
+        elif re.fullmatch(r'away\s*absences', k):
+            payload['away']['absences'] = parse_absences_list(v)
 
-        # Parse Stats (strictly after colon + word boundaries)
-        if active_side in ('home', 'away') and ':' in ln and section in ('stats', None):
-            if re.search(r'\b(gf|goals\s+scored)\b', low):
-                val = parse_number_after_colon(ln)
-                if val is not None:
-                    payload[active_side]['gf'] = val
-                continue
-            if re.search(r'\b(ga|goals\s+conceded)\b', low):
-                val = parse_number_after_colon(ln)
-                if val is not None:
-                    payload[active_side]['ga'] = val
-                continue
-            if re.search(r'\belo\b', low):
-                val = parse_number_after_colon(ln)
-                if val is not None:
-                    payload[active_side]['elo'] = val
-                continue
-
-        # Parse Absences (only while inside absences section and active_side is known)
-        if section == 'absences' and active_side in ('home', 'away') and ln.startswith(('-', '*')):
-            item_txt = ln.lstrip('-* ').strip()
-            pos = 'MID'
-            if re.search(r'\b(fwd|forward|striker|st|att)\b', item_txt, re.I):
-                pos = 'FWD'
-            elif re.search(r'\b(def|defender|gk|goalkeeper)\b', item_txt, re.I):
-                pos = 'DEF'
-            imp = 'star' if re.search(r'\bstar\b', item_txt, re.I) else 'starter'
-            player_name = re.split(r'\(|–|-', item_txt)[0].strip()
-            payload[active_side]['absences'].append({'player': player_name, 'position': pos, 'importance': imp})
-            continue
-
-        # Parse H2H
-        if section == 'h2h' and ln.startswith(('-', '*')):
-            payload['h2h'].append(ln.lstrip('-* ').strip())
-            continue
-
-        # Parse Explicit Odds Labels
-        if ':' in ln and (section == 'odds' or re.search(r'\bodds\b', low)):
-            val = parse_number_after_colon(ln)
-            if val is not None:
-                if re.search(r'\b(home\s*odds|odds\s*1)\b', low):
-                    payload['odds']['home'] = val
-                elif re.search(r'\b(draw\s*odds|odds\s*x)\b', low):
-                    payload['odds']['draw'] = val
-                elif re.search(r'\b(away\s*odds|odds\s*2)\b', low):
-                    payload['odds']['away'] = val
+        # Odds fields
+        elif re.fullmatch(r'odds\s*1|home\s*odds', k):
+            payload['odds']['home'] = parse_number_after_colon(ln)
+        elif re.fullmatch(r'odds\s*x|draw\s*odds', k):
+            payload['odds']['draw'] = parse_number_after_colon(ln)
+        elif re.fullmatch(r'odds\s*2|away\s*odds', k):
+            payload['odds']['away'] = parse_number_after_colon(ln)
 
     return validate_match_payload(payload)
 
@@ -353,7 +332,7 @@ def get_api_key():
 
 def api_get(path, params, key):
     if not key or not key.strip():
-        raise RuntimeError("API-Football key is required for Automatic API Mode.")
+        raise RuntimeError("API-Football key is required for Live API Mode.")
     resp = requests.get(f"{API_BASE}/{path.lstrip('/')}", headers={'x-apisports-key': key.strip()}, params=params, timeout=20)
     resp.raise_for_status()
     body = resp.json()
@@ -423,10 +402,8 @@ def execute_and_save_model(payload, source_mode, neutral_venue, home_adv, rho, e
     lh, ma = calculate_expected_goals(payload, elo_weight=elo_weight)
     M = compute_score_matrix(lh, ma, rho=rho, home_adv=home_adv, unc=unc)
     res = extract_markets(M)
-    res['lh_base'] = lh
-    res['ma_base'] = ma
-    st.session_state['match_v51'] = payload
-    st.session_state['res_v51'] = res
+    st.session_state['match_v52'] = payload
+    st.session_state['res_v52'] = res
 
     with db() as con:
         con.execute('''INSERT INTO predictions
@@ -445,7 +422,7 @@ def execute_and_save_model(payload, source_mode, neutral_venue, home_adv, rho, e
 # ---------------- Sidebar Controls ----------------
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/football-ball-1.png", width=64)
-    st.title("Match Lab V5.1")
+    st.title("Match Lab V5.2")
 
     api_key_input = st.text_input("API-Football Key (For Live API Mode)", type="password", value=get_api_key())
     st.session_state['api_key'] = api_key_input
@@ -459,23 +436,22 @@ with st.sidebar:
     uncertainty_val = st.slider("Rate Uncertainty (Sigma)", 0.05, 0.30, 0.15, 0.01)
 
 # ---------------- Main UI & Tabs ----------------
-st.title("⚽ Football Match Lab V5.1 — Unified Calibrated Engine")
-st.caption("Strict Validation • Manual / Structured Block / Live API Modes • Vectorized Dixon-Coles • Brier Calibration")
+st.title("⚽ Football Match Lab V5.2 — One-Paste & Live API Engine")
+st.caption("Single-Box Paste (Text or JSON) • Live API Fetch • Strict Validation • Vectorized Dixon-Coles")
 
 tabs = st.tabs([
-    "📥 1. Match Input (Manual / Block / API)",
+    "📥 1. One-Paste Input / API",
     "🎲 2. Prediction & Score Matrix",
     "📊 3. Market Odds & EV",
     "🗄️ 4. History & Accuracy"
 ])
 
-# ---------------- TAB 0: UNIFIED INPUT ----------------
+# ---------------- TAB 0: ONE-PASTE INPUT & API ----------------
 with tabs[0]:
     input_mode = st.radio(
-        "Select Data Input System:",
+        "Select Input Mode:",
         [
-            "Structured JSON / Match Block Paste",
-            "Manual Form Builder",
+            "One-Paste Match Block (Text or JSON)",
             "API-Football Live Fetch"
         ],
         horizontal=True
@@ -483,154 +459,66 @@ with tabs[0]:
 
     st.divider()
 
-    # --- MODE A: STRUCTURED BLOCK / JSON PASTE ---
-    if input_mode == "Structured JSON / Match Block Paste":
-        st.subheader("Paste JSON or Strict Sectioned Match Block")
-        st.caption("No hidden defaults. Missing or 'Unverified' fields will be rejected with an exact error list, and valid inputs will trigger the simulation automatically.")
+    if input_mode == "One-Paste Match Block (Text or JSON)":
+        st.subheader("Paste Complete Match Block (One Single Box)")
+        st.caption("Paste either the simple 15-line Key: Value block OR raw JSON below. Everything runs in one click.")
 
-        template_json = """{
-  "home": {
-    "name": "Italy",
-    "gf": 1.67,
-    "ga": 1.15,
-    "sample_size": 6,
-    "elo": 1840,
-    "avg_opp_elo": 1780,
-    "absences": [
-      {"player": "Giovanni Di Lorenzo", "position": "DEF", "importance": "starter"},
-      {"player": "Moise Kean", "position": "FWD", "importance": "starter"}
-    ]
-  },
-  "away": {
-    "name": "France",
-    "gf": 2.10,
-    "ga": 0.75,
-    "sample_size": 6,
-    "elo": 1910,
-    "avg_opp_elo": 1790,
-    "absences": [
-      {"player": "William Saliba", "position": "DEF", "importance": "star"},
-      {"player": "Ousmane Dembélé", "position": "FWD", "importance": "star"}
-    ]
-  },
-  "odds": {
-    "home": 2.75,
-    "draw": 3.20,
-    "away": 2.45
-  }
-}"""
-        raw_block = st.text_area("Match Data Block (JSON or Sectioned Text)", value="", placeholder=template_json, height=340)
+        one_paste_template = """Home Team: Italy
+Home GF: 1.67
+Home GA: 1.15
+Home Elo: 1840
+Home Absences: Giovanni Di Lorenzo (DEF, starter), Moise Kean (FWD, starter)
+
+Away Team: France
+Away GF: 2.10
+Away GA: 0.75
+Away Elo: 1910
+Away Absences: William Saliba (DEF, star), Ousmane Dembélé (FWD, star)
+
+Odds 1: 2.75
+Odds X: 3.20
+Odds 2: 2.45"""
+
+        with st.expander("📋 Click to Copy Blank Template"):
+            st.code(one_paste_template, language="yaml")
+
+        raw_paste = st.text_area(
+            "Paste Match Block (Key: Value Text OR JSON) Here:",
+            value="",
+            placeholder=one_paste_template,
+            height=340,
+            key="one_paste_box"
+        )
 
         if st.button("🚀 Validate & Run Simulation", type="primary", use_container_width=True):
-            if not raw_block.strip():
-                st.error("Input box is empty. Paste a match JSON or structured block first.")
+            if not raw_paste.strip():
+                st.error("Paste box is empty. Paste a match block first.")
             else:
-                parsed, errs = parse_structured_text_block(raw_block)
+                parsed, errs = parse_one_paste_input(raw_paste)
                 if errs:
-                    st.error("❌ Validation Failed — Please fix these fields:")
+                    st.error("❌ Validation Failed — Fix these fields:")
                     for e in errs:
                         st.write(f"- {e}")
                 else:
-                    execute_and_save_model(parsed, "Block/JSON", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val)
-                    st.success(f"✅ Validated & Simulated: **{parsed['home']['name']} vs {parsed['away']['name']}**! Open Tab 2 to view full breakdown.")
+                    execute_and_save_model(parsed, "One-Paste", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val)
+                    st.success(f"✅ Validated & Simulated: **{parsed['home']['name']} (Elo {parsed['home']['elo']}) vs {parsed['away']['name']} (Elo {parsed['away']['elo']})**! Switch to Tab 2 to view results.")
 
-    # --- MODE B: MANUAL FORM BUILDER ---
-    elif input_mode == "Manual Form Builder":
-        st.subheader("Manual Match Entry Form")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("### 🏠 Home Team")
-            m_h_name = st.text_input("Home Team Name", value="")
-            m_h_gf = st.number_input("Home Avg Goals Scored (GF)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.80")
-            m_h_ga = st.number_input("Home Avg Goals Conceded (GA)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.05")
-            m_h_elo = st.number_input("Home Elo Rating", min_value=800.0, max_value=2600.0, value=None, step=5.0, placeholder="e.g. 1850")
-            m_h_sample = st.number_input("Home Matches Sample Size", min_value=1, max_value=50, value=6)
-            m_h_opp_elo = st.number_input("Home Avg Opponent Elo", min_value=800.0, max_value=2600.0, value=1750.0, step=10.0)
-
-        with c2:
-            st.markdown("### ✈️ Away Team")
-            m_a_name = st.text_input("Away Team Name", value="")
-            m_a_gf = st.number_input("Away Avg Goals Scored (GF)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.50")
-            m_a_ga = st.number_input("Away Avg Goals Conceded (GA)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.20")
-            m_a_elo = st.number_input("Away Elo Rating", min_value=800.0, max_value=2600.0, value=None, step=5.0, placeholder="e.g. 1810")
-            m_a_sample = st.number_input("Away Matches Sample Size", min_value=1, max_value=50, value=6)
-            m_a_opp_elo = st.number_input("Away Avg Opponent Elo", min_value=800.0, max_value=2600.0, value=1750.0, step=10.0)
-
-        st.markdown("### 🏥 Role-Based Key Absences")
-        ac1, ac2 = st.columns(2)
-        with ac1:
-            st.caption("Home Absences")
-            h_abs_df = st.data_editor(
-                pd.DataFrame(columns=["player", "position", "importance"]),
-                column_config={
-                    "position": st.column_config.SelectboxColumn("Position", options=["FWD", "MID", "DEF", "GK"], required=True),
-                    "importance": st.column_config.SelectboxColumn("Importance", options=["star", "starter", "rotation"], required=True),
-                },
-                num_rows="dynamic",
-                key="manual_h_abs",
-                use_container_width=True
-            )
-        with ac2:
-            st.caption("Away Absences")
-            a_abs_df = st.data_editor(
-                pd.DataFrame(columns=["player", "position", "importance"]),
-                column_config={
-                    "position": st.column_config.SelectboxColumn("Position", options=["FWD", "MID", "DEF", "GK"], required=True),
-                    "importance": st.column_config.SelectboxColumn("Importance", options=["star", "starter", "rotation"], required=True),
-                },
-                num_rows="dynamic",
-                key="manual_a_abs",
-                use_container_width=True
-            )
-
-        st.markdown("### 💰 Bookmaker 1X2 Decimal Odds")
-        oc1, oc2, oc3 = st.columns(3)
-        m_odd_h = oc1.number_input("Home Odds (1)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 2.10")
-        m_odd_d = oc2.number_input("Draw Odds (X)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 3.40")
-        m_odd_a = oc3.number_input("Away Odds (2)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 3.50")
-
-        if st.button("🚀 Validate Manual Form & Run Simulation", type="primary", use_container_width=True):
-            manual_payload = {
-                'home': {
-                    'name': m_h_name.strip() if m_h_name else None,
-                    'gf': m_h_gf, 'ga': m_h_ga, 'elo': m_h_elo,
-                    'sample_size': int(m_h_sample), 'avg_opp_elo': float(m_h_opp_elo),
-                    'absences': h_abs_df.dropna(subset=['player']).to_dict(orient='records')
-                },
-                'away': {
-                    'name': m_a_name.strip() if m_a_name else None,
-                    'gf': m_a_gf, 'ga': m_a_ga, 'elo': m_a_elo,
-                    'sample_size': int(m_a_sample), 'avg_opp_elo': float(m_a_opp_elo),
-                    'absences': a_abs_df.dropna(subset=['player']).to_dict(orient='records')
-                },
-                'odds': {'home': m_odd_h, 'draw': m_odd_d, 'away': m_odd_a}
-            }
-            valid_obj, errs = validate_match_payload(manual_payload)
-            if errs:
-                st.error("❌ Missing or Invalid Fields:")
-                for e in errs:
-                    st.write(f"- {e}")
-            else:
-                execute_and_save_model(valid_obj, "Manual Form", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val)
-                st.success(f"✅ Simulation Complete for **{valid_obj['home']['name']} vs {valid_obj['away']['name']}**! Open Tab 2 for full results.")
-
-    # --- MODE C: API-FOOTBALL LIVE FETCH ---
     else:
-        st.subheader("API-Football Automatic Senior-Team Pipeline")
-        st.caption("Fetches real recent GF/GA and confirmed injury lists via API-Football, combined with your Elo & odds inputs.")
+        st.subheader("API-Football Live Senior-Team Pipeline")
+        st.caption("Fetches real recent GF/GA and confirmed injury lists via API-Football.")
 
         ac1, ac2 = st.columns(2)
         with ac1:
             api_h_name = st.text_input("Home Senior Team Name", placeholder="e.g. Arsenal")
-            api_h_elo = st.number_input("Home Elo Rating (from ClubElo / EloRatings)", min_value=800.0, max_value=2600.0, value=None, step=5.0)
+            api_h_elo = st.number_input("Home Elo Rating", min_value=800.0, max_value=2600.0, value=None, step=5.0)
         with ac2:
             api_a_name = st.text_input("Away Senior Team Name", placeholder="e.g. Chelsea")
-            api_a_elo = st.number_input("Away Elo Rating (from ClubElo / EloRatings)", min_value=800.0, max_value=2600.0, value=None, step=5.0)
+            api_a_elo = st.number_input("Away Elo Rating", min_value=800.0, max_value=2600.0, value=None, step=5.0)
 
         ao1, ao2, ao3 = st.columns(3)
-        api_odd_h = ao1.number_input("Bookmaker Home Odds (1)", min_value=1.01, max_value=100.0, value=None, step=0.05)
-        api_odd_d = ao2.number_input("Bookmaker Draw Odds (X)", min_value=1.01, max_value=100.0, value=None, step=0.05)
-        api_odd_a = ao3.number_input("Bookmaker Away Odds (2)", min_value=1.01, max_value=100.0, value=None, step=0.05)
+        api_odd_h = ao1.number_input("Odds 1 (Home)", min_value=1.01, max_value=100.0, value=None, step=0.05)
+        api_odd_d = ao2.number_input("Odds X (Draw)", min_value=1.01, max_value=100.0, value=None, step=0.05)
+        api_odd_a = ao3.number_input("Odds 2 (Away)", min_value=1.01, max_value=100.0, value=None, step=0.05)
 
         if st.button("🌐 Fetch Live API Stats & Run Simulation", type="primary", use_container_width=True):
             key = get_api_key()
@@ -640,7 +528,7 @@ with tabs[0]:
                 st.error("Enter both Home and Away team names.")
             else:
                 try:
-                    with st.spinner("Resolving senior teams, fetching recent fixtures & injury reports..."):
+                    with st.spinner("Resolving senior teams & fetching recent stats..."):
                         ht = resolve_senior_team_api(api_h_name, key)
                         at = resolve_senior_team_api(api_a_name, key)
                         if not ht or not at:
@@ -651,7 +539,6 @@ with tabs[0]:
                             if not h_stats or not a_stats:
                                 st.error("Insufficient completed match history returned by API-Football.")
                             else:
-                                # Check if an upcoming head-to-head fixture exists to pull live injury list
                                 next_fix = api_get('fixtures', {'team': ht['id'], 'next': 10}, key)
                                 fix_id = None
                                 for fx in next_fix:
@@ -680,33 +567,32 @@ with tabs[0]:
                                         st.write(f"- {e}")
                                 else:
                                     execute_and_save_model(valid_obj, "API-Football", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, fixture_id=fix_id)
-                                    st.success(f"✅ API Data Verified & Simulated: **{ht['name']} vs {at['name']}** (Fixture ID: {fix_id or 'Unscheduled'})")
+                                    st.success(f"✅ API Data Verified & Simulated: **{ht['name']} vs {at['name']}**!")
                 except Exception as exc:
                     st.error(f"API Fetch Error: {exc}")
 
 # ---------------- TAB 1: PREDICTION & SCORE MATRIX ----------------
 with tabs[1]:
     st.subheader("Vectorized Dixon-Coles Probabilities & Scorelines")
-    data = st.session_state.get('match_v51')
-    res = st.session_state.get('res_v51')
+    data = st.session_state.get('match_v52')
+    res = st.session_state.get('res_v52')
 
     if not data or not res:
-        st.info("Validate and run a match in Tab 1 first.")
+        st.info("Paste and run a match in Tab 1 first.")
     else:
         h_name, a_name = data['home']['name'], data['away']['name']
 
-        # Allow instant recalculation if sidebar sliders changed
         if st.button("🔄 Recalculate with Current Sidebar Settings"):
             lh, ma = calculate_expected_goals(data, elo_weight=elo_blend)
             M = compute_score_matrix(lh, ma, rho=dixon_coles_rho, home_adv=home_adv_val, unc=uncertainty_val)
             res = extract_markets(M)
-            st.session_state['res_v51'] = res
+            st.session_state['res_v52'] = res
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric(f"{h_name} Elo", f"{data['home']['elo']}")
         c2.metric(f"{a_name} Elo", f"{data['away']['elo']}")
         c3.metric("Venue Mode", "Neutral (1.00x)" if neutral_venue else f"Home Adv ({home_adv_val:.2f}x)")
-        c4.metric("Absences Logged", f"{len(data['home'].get('absences', []))} H / {len(data['away'].get('absences', []))} A")
+        c4.metric("Absences Parsed", f"{len(data['home'].get('absences', []))} H / {len(data['away'].get('absences', []))} A")
 
         st.divider()
         m1, m2, m3 = st.columns(3)
@@ -728,8 +614,8 @@ with tabs[1]:
 # ---------------- TAB 2: MARKET ODDS & EV ----------------
 with tabs[2]:
     st.subheader("Market Implied Probability, Edge & Expected Value (EV)")
-    data = st.session_state.get('match_v51')
-    res = st.session_state.get('res_v51')
+    data = st.session_state.get('match_v52')
+    res = st.session_state.get('res_v52')
 
     if not data or not res:
         st.info("Run a prediction first to compare against bookmaker odds.")
