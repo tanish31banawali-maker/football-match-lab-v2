@@ -111,7 +111,8 @@ def extract_markets(M):
     }
 
 # ---------------- Calibrated Strength & Role-Based Absence Model ----------------
-def shrink_rate(obs_rate, sample_size, baseline=1.35, k=8.0):
+def shrink_rate(obs_rate, sample_size, baseline=1.18, k=6.0):
+    """Bayesian shrinkage toward realistic 1.18 goals/team baseline."""
     w = sample_size / (sample_size + k)
     return w * obs_rate + (1.0 - w) * baseline
 
@@ -119,11 +120,13 @@ def calculate_expected_goals(data, elo_weight=0.35):
     h = data['home']
     a = data['away']
 
+    # 1. Shrink observed rates toward realistic 1.18 baseline
     h_gf_s = shrink_rate(h['gf'], h.get('sample_size', 6))
     h_ga_s = shrink_rate(h['ga'], h.get('sample_size', 6))
     a_gf_s = shrink_rate(a['gf'], a.get('sample_size', 6))
     a_ga_s = shrink_rate(a['ga'], a.get('sample_size', 6))
 
+    # 2. Opponent strength adjustment on recent schedule
     h_opp_fac = 10.0 ** ((h.get('avg_opp_elo', 1750.0) - 1750.0) / 1000.0)
     a_opp_fac = 10.0 ** ((a.get('avg_opp_elo', 1750.0) - 1750.0) / 1000.0)
 
@@ -132,9 +135,11 @@ def calculate_expected_goals(data, elo_weight=0.35):
     a_gf_adj = a_gf_s * a_opp_fac
     a_ga_adj = a_ga_s / a_opp_fac
 
-    base_lh = 0.55 * h_gf_adj + 0.45 * a_ga_adj
-    base_ma = 0.55 * a_gf_adj + 0.45 * h_ga_adj
+    # 3. Geometric mean blend (more sensitive to low-scoring/high-scoring teams than linear average)
+    base_lh = math.sqrt(max(0.05, h_gf_adj) * max(0.05, a_ga_adj))
+    base_ma = math.sqrt(max(0.05, a_gf_adj) * max(0.05, h_ga_adj))
 
+    # 4. Zero-sum Elo share adjustment (shifts xG between teams without inflating total goals)
     elo_diff = h['elo'] - a['elo']
     raw_elo_h = 10.0 ** (elo_diff / 1200.0)
     raw_elo_a = 10.0 ** (-elo_diff / 1200.0)
@@ -142,9 +147,18 @@ def calculate_expected_goals(data, elo_weight=0.35):
     elo_mult_h = (1.0 - elo_weight) + elo_weight * raw_elo_h
     elo_mult_a = (1.0 - elo_weight) + elo_weight * raw_elo_a
 
-    lh = base_lh * elo_mult_h
-    ma = base_ma * elo_mult_a
+    # Normalize Elo multipliers so total match goals aren't artificially inflated
+    total_before_elo = base_lh + base_ma
+    lh_elo = base_lh * elo_mult_h
+    ma_elo = base_ma * elo_mult_a
+    if (lh_elo + ma_elo) > 0:
+        norm_factor = total_before_elo / (lh_elo + ma_elo)
+        lh = lh_elo * norm_factor
+        ma = ma_elo * norm_factor
+    else:
+        lh, ma = base_lh, base_ma
 
+    # 5. Role-based & importance-weighted absence impact
     imp_weights = {'star': 0.06, 'starter': 0.035, 'rotation': 0.015}
 
     def calc_absence_effects(absences):
@@ -168,7 +182,6 @@ def calculate_expected_goals(data, elo_weight=0.35):
     ma = ma * max(0.65, 1.0 - a_att_pen) * min(1.35, 1.0 + h_def_leak)
 
     return round(lh, 3), round(ma, 3)
-
 # ---------------- Strict Validation & One-Paste Parsers ----------------
 def validate_match_payload(data):
     if not isinstance(data, dict):
