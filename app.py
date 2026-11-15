@@ -10,13 +10,22 @@ import urllib.parse
 import requests
 from datetime import datetime
 
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
 # ---------------- App & Database Configuration ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, 'football_lab_v5_1.db')
 API_BASE = 'https://v3.football.api-sports.io'
 
 st.set_page_config(
-    page_title='Football Match Lab V5.1 + SofaScore Import',
+    page_title='Football Match Lab V5.2 + Screenshot Import & Ratings',
     page_icon='⚽',
     layout='wide',
     initial_sidebar_state='expanded'
@@ -51,8 +60,22 @@ def init_db():
             odd_a REAL,
             actual_home INTEGER,
             actual_away INTEGER,
-            settled_at TEXT
+            settled_at TEXT,
+            home_attributes_json TEXT,
+            away_attributes_json TEXT,
+            home_players_json TEXT,
+            away_players_json TEXT
         )''')
+        # Add columns to an existing V5.1 database without deleting its history.
+        existing_columns = {
+            row[1] for row in con.execute("PRAGMA table_info(predictions)").fetchall()
+        }
+        for column in (
+            "home_attributes_json", "away_attributes_json",
+            "home_players_json", "away_players_json"
+        ):
+            if column not in existing_columns:
+                con.execute(f"ALTER TABLE predictions ADD COLUMN {column} TEXT")
         # One record per tracked market and prediction. This is separate from
         # the match table so each market can be audited independently.
         con.execute('''CREATE TABLE IF NOT EXISTS market_settlements (
@@ -211,6 +234,29 @@ def calculate_expected_goals(data, elo_weight=0.35):
     lh = base_lh * elo_mult_h
     ma = base_ma * elo_mult_a
 
+    # Optional attribute ratings: neutral at 50; capped to avoid overpowering form/Elo.
+    def attribute_attack_factor(team):
+        r = team.get("attributes") or {}
+        attack = float(r.get("attack", 50))
+        midfield = float(r.get("midfield", 50))
+        form = float(r.get("form", 50))
+        squad = float(r.get("squad_strength", 50))
+        return min(1.12, max(0.88, 1.0 + (
+            0.40 * (attack - 50) + 0.20 * (midfield - 50) +
+            0.20 * (form - 50) + 0.20 * (squad - 50)
+        ) / 1000.0))
+
+    def attribute_defence_factor(team):
+        r = team.get("attributes") or {}
+        defence = float(r.get("defence", 50))
+        goalkeeping = float(r.get("goalkeeping", 50))
+        return min(1.10, max(0.90, 1.0 - (
+            0.65 * (defence - 50) + 0.35 * (goalkeeping - 50)
+        ) / 1000.0))
+
+    lh *= attribute_attack_factor(h) * attribute_defence_factor(a)
+    ma *= attribute_attack_factor(a) * attribute_defence_factor(h)
+
     # Role-based & importance-weighted absence impact
     imp_weights = {'star': 0.06, 'starter': 0.035, 'rotation': 0.015}
 
@@ -235,6 +281,68 @@ def calculate_expected_goals(data, elo_weight=0.35):
     ma = ma * max(0.65, 1.0 - a_att_pen) * min(1.35, 1.0 + h_def_leak)
 
     return round(lh, 3), round(ma, 3)
+
+
+# ---------------- Screenshot OCR & Attribute Ratings ----------------
+def extract_screenshot_text(uploaded_file):
+    """Try OCR when pytesseract and the local Tesseract engine are installed."""
+    if Image is None or pytesseract is None:
+        raise RuntimeError(
+            "OCR is not installed. Install Pillow and pytesseract, plus the Tesseract OCR "
+            "application, or type/paste the screenshot details into the review box."
+        )
+    image = Image.open(uploaded_file).convert("RGB")
+    return pytesseract.image_to_string(image)
+
+def render_team_attribute_ratings(prefix):
+    """Optional 0–100 team ratings. Missing ratings remain neutral and are not guessed."""
+    st.markdown("#### Team Attribute Ratings (optional)")
+    st.caption("Enter ratings only when you have a source. Leave sliders at 50 for neutral/no adjustment.")
+    labels = ["Attack", "Defence", "Midfield", "Goalkeeping", "Form", "Squad Strength"]
+    cols = st.columns(3)
+    ratings = {}
+    for i, label in enumerate(labels):
+        ratings[label.lower().replace(" ", "_")] = cols[i % 3].slider(
+            f"{prefix} {label}", 0, 100, 50, 1, key=f"{prefix}_{label}_rating"
+        )
+    ratings["overall"] = round(sum(ratings.values()) / len(ratings), 1)
+    return ratings
+
+def render_player_attribute_table(prefix):
+    """Optional player ratings; these are displayed/stored with the match payload."""
+    st.markdown("#### Optional Player Attribute Ratings")
+    st.caption("Add players only when you have ratings. These ratings are not inferred from names.")
+    return st.data_editor(
+        pd.DataFrame(columns=[
+            "player", "position", "pace", "shooting", "passing",
+            "dribbling", "defending", "physical", "overall"
+        ]),
+        column_config={
+            "position": st.column_config.SelectboxColumn(
+                "Position", options=["GK", "DEF", "MID", "FWD"]
+            ),
+            **{
+                col: st.column_config.NumberColumn(col.title(), min_value=0, max_value=100, step=1)
+                for col in ["pace", "shooting", "passing", "dribbling", "defending", "physical", "overall"]
+            },
+        },
+        num_rows="dynamic",
+        key=f"{prefix}_player_ratings",
+        use_container_width=True
+    )
+
+def apply_attribute_ratings(payload, home_ratings=None, away_ratings=None,
+                            home_players=None, away_players=None):
+    """Attach optional ratings and apply a deliberately small rating-based xG modifier."""
+    for side, ratings, players in [
+        ("home", home_ratings, home_players),
+        ("away", away_ratings, away_players),
+    ]:
+        if ratings:
+            payload[side]["attributes"] = ratings
+        if players is not None:
+            payload[side]["player_ratings"] = players
+    return payload
 
 # ---------------- Strict Validation & Parsers (No Silent Defaults) ----------------
 def validate_match_payload(data):
@@ -644,14 +752,19 @@ def execute_and_save_model(payload, source_mode, neutral_venue, home_adv, rho, e
         con.execute('''INSERT INTO predictions
             (created_at, source_mode, fixture_id, home, away, neutral_venue,
              p_home, p_draw, p_away, p_over15, p_over25, p_over35, p_btts,
-             exp_home, exp_away, odd_h, odd_d, odd_a)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+             exp_home, exp_away, odd_h, odd_d, odd_a,
+             home_attributes_json, away_attributes_json, home_players_json, away_players_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (datetime.now().strftime("%Y-%m-%d %H:%M"), source_mode, fixture_id,
              payload['home']['name'], payload['away']['name'], int(neutral_venue),
              res['p_home'], res['p_draw'], res['p_away'],
              res['p_over15'], res['p_over25'], res['p_over35'], res['p_btts'],
              res['exp_home'], res['exp_away'],
-             payload['odds']['home'], payload['odds']['draw'], payload['odds']['away'])
+             payload['odds']['home'], payload['odds']['draw'], payload['odds']['away'],
+             json.dumps(payload['home'].get('attributes', {}), ensure_ascii=False),
+             json.dumps(payload['away'].get('attributes', {}), ensure_ascii=False),
+             json.dumps(payload['home'].get('player_ratings', []), ensure_ascii=False),
+             json.dumps(payload['away'].get('player_ratings', []), ensure_ascii=False))
         )
 
 # ---------------- Sidebar Controls ----------------
@@ -671,8 +784,8 @@ with st.sidebar:
     uncertainty_val = st.slider("Rate Uncertainty (Sigma)", 0.05, 0.30, 0.15, 0.01)
 
 # ---------------- Main UI & Tabs ----------------
-st.title("⚽ Football Match Lab V5.1 — Unified Calibrated Engine")
-st.caption("Strict Validation • Manual / Block / SofaScore URL / Live API • Vectorized Dixon-Coles • Market Settlement Tracking")
+st.title("⚽ Football Match Lab V5.2 — Screenshot Import & Attribute Ratings")
+st.caption("Screenshot OCR + Editable Review • Team & Player Ratings • SofaScore / API • Market Settlement Tracking")
 
 tabs = st.tabs([
     "📥 1. Match Input (Manual / Block / API)",
@@ -689,7 +802,8 @@ with tabs[0]:
             "Structured JSON / Match Block Paste",
             "Manual Form Builder",
             "SofaScore Match URL Import",
-            "API-Football Live Fetch"
+            "API-Football Live Fetch",
+            "Screenshot Import (OCR + Review)"
         ],
         horizontal=True
     )
@@ -796,6 +910,15 @@ with tabs[0]:
                 use_container_width=True
             )
 
+
+        mr1, mr2 = st.columns(2)
+        with mr1:
+            manual_home_ratings = render_team_attribute_ratings("Manual Home")
+            manual_home_players = render_player_attribute_table("Manual Home")
+        with mr2:
+            manual_away_ratings = render_team_attribute_ratings("Manual Away")
+            manual_away_players = render_player_attribute_table("Manual Away")
+
         st.markdown("### 💰 Bookmaker 1X2 Decimal Odds")
         oc1, oc2, oc3 = st.columns(3)
         m_odd_h = oc1.number_input("Home Odds (1)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 2.10")
@@ -818,6 +941,12 @@ with tabs[0]:
                 },
                 'odds': {'home': m_odd_h, 'draw': m_odd_d, 'away': m_odd_a}
             }
+            manual_payload = apply_attribute_ratings(
+                manual_payload,
+                manual_home_ratings, manual_away_ratings,
+                manual_home_players.dropna(subset=["player"]).to_dict(orient="records"),
+                manual_away_players.dropna(subset=["player"]).to_dict(orient="records")
+            )
             valid_obj, errs = validate_match_payload(manual_payload)
             if errs:
                 st.error("❌ Missing or Invalid Fields:")
@@ -894,6 +1023,95 @@ with tabs[0]:
                 else:
                     execute_and_save_model(valid, "SofaScore URL", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, fixture_id=sofa_data.get("event_id"))
                     st.success(f"Simulation completed: {sofa_data['event_name']}. Open Tab 2 for results.")
+
+
+    # --- MODE E: SCREENSHOT IMPORT WITH OCR + HUMAN REVIEW ---
+    elif input_mode == "Screenshot Import (OCR + Review)":
+        st.subheader("Import Match Information from Screenshots")
+        st.caption(
+            "Upload screenshots from SofaScore or another source. OCR is only a first draft: "
+            "check and correct every value before running the simulation."
+        )
+        uploaded_images = st.file_uploader(
+            "Upload match screenshots",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key="match_screenshot_uploads"
+        )
+
+        if st.button("🔍 Read Text from Screenshots", use_container_width=True):
+            if not uploaded_images:
+                st.warning("Upload at least one screenshot first.")
+            else:
+                extracted = []
+                for image_file in uploaded_images:
+                    try:
+                        extracted.append(
+                            f"--- {image_file.name} ---\\n{extract_screenshot_text(image_file)}"
+                        )
+                    except Exception as exc:
+                        extracted.append(f"--- {image_file.name} ---\\nOCR unavailable: {exc}")
+                st.session_state["screenshot_ocr_text"] = "\\n\\n".join(extracted)
+
+        if uploaded_images:
+            with st.expander("View uploaded screenshots"):
+                for image_file in uploaded_images:
+                    st.image(image_file, caption=image_file.name, use_container_width=True)
+
+        ocr_review_text = st.text_area(
+            "OCR text — review and edit this text, then make sure it follows the match block format",
+            value=st.session_state.get("screenshot_ocr_text", ""),
+            height=260,
+            key="screenshot_review_text",
+            placeholder=(
+                "Home Team: ...\\nHome GF: ...\\nHome GA: ...\\nHome Elo: ...\\n"
+                "Away Team: ...\\nAway GF: ...\\nAway GA: ...\\nAway Elo: ...\\n"
+                "Odds 1: ...\\nOdds X: ...\\nOdds 2: ..."
+            )
+        )
+        st.info(
+            "OCR may misread team names, numbers and decimal odds. Correct the text manually. "
+            "The app will not invent missing Elo ratings or bookmaker odds."
+        )
+
+        if st.button("Continue to Ratings and Validate Screenshot Data", type="primary", use_container_width=True):
+            parsed, parse_errors = parse_structured_text_block(ocr_review_text)
+            if parse_errors:
+                st.error("The reviewed text is not complete yet. Fix these fields:")
+                for err in parse_errors:
+                    st.write("- " + err)
+            else:
+                st.session_state["screenshot_parsed_payload"] = parsed
+                st.success("Text parsed. Add optional team/player ratings below, then run the simulation.")
+
+        screenshot_payload = st.session_state.get("screenshot_parsed_payload")
+        if screenshot_payload:
+            st.markdown(
+                f"### {screenshot_payload['home']['name']} vs {screenshot_payload['away']['name']}"
+            )
+            r1, r2 = st.columns(2)
+            with r1:
+                screenshot_home_ratings = render_team_attribute_ratings("Screenshot Home")
+                screenshot_home_players = render_player_attribute_table("Screenshot Home")
+            with r2:
+                screenshot_away_ratings = render_team_attribute_ratings("Screenshot Away")
+                screenshot_away_players = render_player_attribute_table("Screenshot Away")
+
+            if st.button("⚽ Run Simulation from Reviewed Screenshot Data", type="primary", use_container_width=True):
+                final_payload = apply_attribute_ratings(
+                    dict(screenshot_payload),
+                    screenshot_home_ratings, screenshot_away_ratings,
+                    screenshot_home_players.dropna(subset=["player"]).to_dict(orient="records"),
+                    screenshot_away_players.dropna(subset=["player"]).to_dict(orient="records")
+                )
+                execute_and_save_model(
+                    final_payload, "Screenshot Import", neutral_venue,
+                    home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val
+                )
+                st.success(
+                    f"Simulation completed for {final_payload['home']['name']} vs "
+                    f"{final_payload['away']['name']}. Open Tab 2 for results."
+                )
 
     # --- MODE D: API-FOOTBALL LIVE FETCH ---
     else:
