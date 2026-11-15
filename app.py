@@ -739,9 +739,9 @@ def fetch_team_injuries_api(fixture_id, home_id, away_id, key):
     return h_abs, a_abs
 
 # ---------------- Helper to Run & Log Prediction ----------------
-def execute_and_save_model(payload, source_mode, neutral_venue, home_adv, rho, elo_weight, unc, fixture_id=None):
+def execute_and_save_model(payload, source_mode, neutral_venue, home_adv, rho, elo_weight, unc, simulation_count=2500, fixture_id=None):
     lh, ma = calculate_expected_goals(payload, elo_weight=elo_weight)
-    M = compute_score_matrix(lh, ma, rho=rho, home_adv=home_adv, unc=unc)
+    M = compute_score_matrix(lh, ma, rho=rho, home_adv=home_adv, unc=unc, n=simulation_count)
     res = extract_markets(M)
     res['lh_base'] = lh
     res['ma_base'] = ma
@@ -782,6 +782,13 @@ with st.sidebar:
     dixon_coles_rho = st.slider("Dixon-Coles Rho (Draw Tuning)", -0.30, 0.00, -0.13, 0.01)
     elo_blend = st.slider("Elo Weight (Prevents Double-Counting)", 0.0, 1.0, 0.35, 0.05)
     uncertainty_val = st.slider("Rate Uncertainty (Sigma)", 0.05, 0.30, 0.15, 0.01)
+    simulation_count = st.selectbox(
+        "Monte Carlo Simulation Runs",
+        options=[2500, 5000, 10000, 25000, 50000],
+        index=0,
+        format_func=lambda value: f"{value:,} simulations"
+    )
+    st.caption("More runs reduce simulation noise but do not guarantee more accurate predictions.")
 
 # ---------------- Main UI & Tabs ----------------
 st.title("⚽ Football Match Lab V5.2 — Screenshot Import & Attribute Ratings")
@@ -858,7 +865,7 @@ with tabs[0]:
                     for e in errs:
                         st.write(f"- {e}")
                 else:
-                    execute_and_save_model(parsed, "Block/JSON", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val)
+                    execute_and_save_model(parsed, "Block/JSON", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, simulation_count=simulation_count)
                     st.success(f"✅ Validated & Simulated: **{parsed['home']['name']} vs {parsed['away']['name']}**! Open Tab 2 to view full breakdown.")
 
     # --- MODE B: MANUAL FORM BUILDER ---
@@ -953,7 +960,7 @@ with tabs[0]:
                 for e in errs:
                     st.write(f"- {e}")
             else:
-                execute_and_save_model(valid_obj, "Manual Form", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val)
+                execute_and_save_model(valid_obj, "Manual Form", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, simulation_count=simulation_count)
                 st.success(f"✅ Simulation Complete for **{valid_obj['home']['name']} vs {valid_obj['away']['name']}**! Open Tab 2 for full results.")
 
     # --- MODE C: SOFASCORE MATCH URL IMPORT ---
@@ -1021,7 +1028,7 @@ with tabs[0]:
                     for error in errors:
                         st.write("- " + error)
                 else:
-                    execute_and_save_model(valid, "SofaScore URL", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, fixture_id=sofa_data.get("event_id"))
+                    execute_and_save_model(valid, "SofaScore URL", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, simulation_count=simulation_count, fixture_id=sofa_data.get("event_id"))
                     st.success(f"Simulation completed: {sofa_data['event_name']}. Open Tab 2 for results.")
 
 
@@ -1106,7 +1113,7 @@ with tabs[0]:
                 )
                 execute_and_save_model(
                     final_payload, "Screenshot Import", neutral_venue,
-                    home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val
+                    home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, simulation_count=simulation_count
                 )
                 st.success(
                     f"Simulation completed for {final_payload['home']['name']} vs "
@@ -1178,7 +1185,7 @@ with tabs[0]:
                                     for e in errs:
                                         st.write(f"- {e}")
                                 else:
-                                    execute_and_save_model(valid_obj, "API-Football", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, fixture_id=fix_id)
+                                    execute_and_save_model(valid_obj, "API-Football", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, simulation_count=simulation_count, fixture_id=fix_id)
                                     st.success(f"✅ API Data Verified & Simulated: **{ht['name']} vs {at['name']}** (Fixture ID: {fix_id or 'Unscheduled'})")
                 except Exception as exc:
                     st.error(f"API Fetch Error: {exc}")
@@ -1197,7 +1204,7 @@ with tabs[1]:
         # Allow instant recalculation if sidebar sliders changed
         if st.button("🔄 Recalculate with Current Sidebar Settings"):
             lh, ma = calculate_expected_goals(data, elo_weight=elo_blend)
-            M = compute_score_matrix(lh, ma, rho=dixon_coles_rho, home_adv=home_adv_val, unc=uncertainty_val)
+            M = compute_score_matrix(lh, ma, rho=dixon_coles_rho, home_adv=home_adv_val, unc=uncertainty_val, n=simulation_count)
             res = extract_markets(M)
             st.session_state['res_v51'] = res
 
