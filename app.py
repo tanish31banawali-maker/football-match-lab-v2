@@ -416,13 +416,80 @@ def sofascore_get(path):
     return response.json()
 
 def sofascore_event_id(url):
-    """Supports SofaScore URLs containing #id:123456 or /event/123456."""
+    """Supports exact SofaScore match URLs containing #id:123456 or /event/123456."""
     if not re.match(r"^https?://([a-z0-9-]+\.)?sofascore\.com/", url.strip(), re.I):
-        raise ValueError("Please paste a valid sofascore.com match URL.")
+        raise ValueError("Please paste a valid sofascore.com URL.")
     match = re.search(r"(?:id:|/event/)(\d+)", url)
     if not match:
-        raise ValueError("Could not find the match ID in this link. Copy the full match URL from SofaScore.")
+        raise ValueError("This is not a specific match URL. If it is a Team Compare link, the importer will use the two team IDs instead.")
     return int(match.group(1))
+
+
+def sofascore_compare_team_ids(url):
+    """Read the two team IDs from SofaScore /football/team/compare?ids=... links."""
+    parsed = urllib.parse.urlparse(url.strip())
+    if not re.match(r"^https?://([a-z0-9-]+\.)?sofascore\.com$", f"{parsed.scheme}://{parsed.netloc}", re.I):
+        raise ValueError("Please paste a valid sofascore.com URL.")
+    if "/team/compare" not in parsed.path:
+        return None
+    params = urllib.parse.parse_qs(parsed.query)
+    ids = params.get("ids", [""])[0].split(",")
+    ids = [x.strip() for x in ids if x.strip().isdigit()]
+    if len(ids) != 2:
+        raise ValueError("This Team Compare link must contain exactly two team IDs in its ids= parameter.")
+    return int(ids[0]), int(ids[1])
+
+
+def fetch_sofascore_team_compare(url):
+    """Import both teams and recent form from a SofaScore Team Compare URL.
+
+    A compare URL identifies two teams, not one scheduled fixture. Therefore
+    no single match status, kickoff time or event ID can be inferred from it.
+    """
+    home_id, away_id = sofascore_compare_team_ids(url)
+    team_data = []
+    for team_id in (home_id, away_id):
+        body = sofascore_get(f"team/{team_id}")
+        team = body.get("team") or body.get("teamInfo") or {}
+        name = team.get("name") or team.get("shortName")
+        if not name:
+            raise RuntimeError(f"SofaScore did not return the name for team ID {team_id}.")
+        gf, ga, n, rows = sofascore_recent_average(team_id)
+        team_data.append({"id": team_id, "name": name, "gf": gf, "ga": ga,
+                          "sample_size": n, "elo": None, "avg_opp_elo": 1750.0,
+                          "absences": [], "recent": rows})
+
+    # Compare the teams' recent event lists to identify shared past meetings.
+    h2h_rows = []
+    try:
+        h_events = sofascore_get(f"team/{home_id}/events/last/0").get("events", [])
+        a_events = sofascore_get(f"team/{away_id}/events/last/0").get("events", [])
+        away_event_ids = {e.get("id") for e in a_events}
+        for e in h_events:
+            if e.get("id") not in away_event_ids:
+                continue
+            ht = (e.get("homeTeam") or {}).get("name", "Home")
+            at = (e.get("awayTeam") or {}).get("name", "Away")
+            hs = (e.get("homeScore") or {}).get("current", "?")
+            aws = (e.get("awayScore") or {}).get("current", "?")
+            h2h_rows.append(f"{ht} {hs}-{aws} {at}")
+            if len(h2h_rows) >= 10:
+                break
+    except Exception:
+        pass
+
+    return {
+        "event_id": None,
+        "home": team_data[0],
+        "away": team_data[1],
+        "h2h": h2h_rows,
+        "event_name": f"{team_data[0]['name']} vs {team_data[1]['name']}",
+        "status": "Team comparison link — no specific fixture selected",
+        "start_timestamp": None,
+        "home_recent": team_data[0]["recent"],
+        "away_recent": team_data[1]["recent"],
+        "source_type": "team_compare",
+    }
 
 def sofascore_recent_average(team_id, count=6):
     """Calculate goals for/against from the team's last completed matches."""
@@ -452,7 +519,10 @@ def sofascore_recent_average(team_id, count=6):
     return round(gf, 3), round(ga, 3), len(rows), rows
 
 def fetch_sofascore_match(url):
-    """Fetch fixture names, last-six goal averages and H2H rows from a SofaScore match link."""
+    """Fetch a SofaScore match URL or Team Compare URL."""
+    compare_ids = sofascore_compare_team_ids(url)
+    if compare_ids:
+        return fetch_sofascore_team_compare(url)
     event_id = sofascore_event_id(url)
     body = sofascore_get(f"event/{event_id}")
     event = body.get("event") or {}
@@ -481,7 +551,7 @@ def fetch_sofascore_match(url):
         "event_name": f"{home['name']} vs {away['name']}",
         "status": (event.get("status") or {}).get("description", "Unknown"),
         "start_timestamp": event.get("startTimestamp"),
-        "home_recent": hrows, "away_recent": arows,
+        "home_recent": hrows, "away_recent": arows, "source_type": "match",
     }
 
 # ---------------- API-Football Live Data Engine ----------------
@@ -772,7 +842,11 @@ with tabs[0]:
         sofa_data = st.session_state.get("sofascore_import")
         if sofa_data:
             st.markdown(f"### {sofa_data['event_name']}")
-            st.caption(f"Fixture status: {sofa_data['status']} • Event ID: {sofa_data['event_id']}")
+            if sofa_data.get("event_id"):
+                st.caption(f"Fixture status: {sofa_data['status']} • Match ID: {sofa_data['event_id']}")
+            else:
+                st.caption(f"Source: SofaScore Team Compare • Team IDs: {sofa_data['home']['id']} and {sofa_data['away']['id']}")
+                st.info("This link compares two teams; it does not identify one specific upcoming match. Recent form and shared past meetings are imported, but fixture date/status are not available from this link.")
             s1, s2 = st.columns(2)
             with s1:
                 st.markdown(f"**{sofa_data['home']['name']} — recent {sofa_data['home']['sample_size']} matches**")
@@ -818,7 +892,7 @@ with tabs[0]:
                     for error in errors:
                         st.write("- " + error)
                 else:
-                    execute_and_save_model(valid, "SofaScore URL", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, fixture_id=sofa_data["event_id"])
+                    execute_and_save_model(valid, "SofaScore URL", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, fixture_id=sofa_data.get("event_id"))
                     st.success(f"Simulation completed: {sofa_data['event_name']}. Open Tab 2 for results.")
 
     # --- MODE D: API-FOOTBALL LIVE FETCH ---
