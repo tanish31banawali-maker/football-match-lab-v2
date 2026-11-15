@@ -16,7 +16,7 @@ DB_PATH = os.path.join(APP_DIR, 'football_lab_v5_1.db')
 API_BASE = 'https://v3.football.api-sports.io'
 
 st.set_page_config(
-    page_title='Football Match Lab V5.1',
+    page_title='Football Match Lab V5.1 + SofaScore Import',
     page_icon='⚽',
     layout='wide',
     initial_sidebar_state='expanded'
@@ -53,8 +53,64 @@ def init_db():
             actual_away INTEGER,
             settled_at TEXT
         )''')
+        # One record per tracked market and prediction. This is separate from
+        # the match table so each market can be audited independently.
+        con.execute('''CREATE TABLE IF NOT EXISTS market_settlements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prediction_id INTEGER NOT NULL,
+            market TEXT NOT NULL,
+            selection TEXT NOT NULL,
+            predicted_yes_probability REAL NOT NULL,
+            selected_probability REAL NOT NULL,
+            actual_yes INTEGER NOT NULL,
+            result TEXT NOT NULL,
+            settled_at TEXT NOT NULL,
+            UNIQUE(prediction_id, market),
+            FOREIGN KEY(prediction_id) REFERENCES predictions(id)
+        )''')
+
+
+def settle_market_records(prediction_id, home_goals, away_goals, settled_at=None):
+    """Save Over 1.5, Over 2.5 and BTTS selections and their actual outcomes."""
+    settled_at = settled_at or datetime.now().strftime("%Y-%m-%d %H:%M")
+    total_goals = int(home_goals) + int(away_goals)
+    with db() as con:
+        row = con.execute("SELECT * FROM predictions WHERE id = ?", (int(prediction_id),)).fetchone()
+        if row is None:
+            return
+        markets = [
+            ("Over 1.5", float(row["p_over15"] or 0.0), total_goals >= 2),
+            ("Over 2.5", float(row["p_over25"] or 0.0), total_goals >= 3),
+            ("BTTS", float(row["p_btts"] or 0.0), int(home_goals) >= 1 and int(away_goals) >= 1),
+        ]
+        for market, p_yes, actual_yes in markets:
+            selection = "Yes" if p_yes >= 0.5 else "No"
+            selected_probability = p_yes if selection == "Yes" else 1.0 - p_yes
+            won = (selection == "Yes" and actual_yes) or (selection == "No" and not actual_yes)
+            con.execute('''INSERT INTO market_settlements
+                (prediction_id, market, selection, predicted_yes_probability,
+                 selected_probability, actual_yes, result, settled_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(prediction_id, market) DO UPDATE SET
+                selection=excluded.selection,
+                predicted_yes_probability=excluded.predicted_yes_probability,
+                selected_probability=excluded.selected_probability,
+                actual_yes=excluded.actual_yes,
+                result=excluded.result,
+                settled_at=excluded.settled_at''',
+                (int(prediction_id), market, selection, p_yes, selected_probability,
+                 int(actual_yes), "WIN" if won else "LOSS", settled_at))
+
+
+def backfill_market_settlements():
+    """Create market records for matches settled before this tracking update."""
+    with db() as con:
+        old_rows = con.execute("SELECT id, actual_home, actual_away FROM predictions WHERE actual_home IS NOT NULL AND actual_away IS NOT NULL").fetchall()
+    for row in old_rows:
+        settle_market_records(row["id"], row["actual_home"], row["actual_away"])
 
 init_db()
+backfill_market_settlements()
 
 # ---------------- Vectorized Dixon-Coles Score Matrix ----------------
 G = np.arange(11)
@@ -342,6 +398,92 @@ def parse_structured_text_block(raw_text):
 
     return validate_match_payload(payload)
 
+
+# ---------------- SofaScore Match-Link Import ----------------
+SOFASCORE_API = "https://www.sofascore.com/api/v1"
+
+def sofascore_get(path):
+    """Read publicly accessible SofaScore match data. This endpoint is unofficial and may be rate-limited."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Referer": "https://www.sofascore.com/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    response = requests.get(f"{SOFASCORE_API}/{path.lstrip('/')}", headers=headers, timeout=20)
+    if response.status_code in (403, 429):
+        raise RuntimeError("SofaScore blocked or rate-limited this request. Try again later or use Manual/Block mode.")
+    response.raise_for_status()
+    return response.json()
+
+def sofascore_event_id(url):
+    """Supports SofaScore URLs containing #id:123456 or /event/123456."""
+    if not re.match(r"^https?://([a-z0-9-]+\.)?sofascore\.com/", url.strip(), re.I):
+        raise ValueError("Please paste a valid sofascore.com match URL.")
+    match = re.search(r"(?:id:|/event/)(\d+)", url)
+    if not match:
+        raise ValueError("Could not find the match ID in this link. Copy the full match URL from SofaScore.")
+    return int(match.group(1))
+
+def sofascore_recent_average(team_id, count=6):
+    """Calculate goals for/against from the team's last completed matches."""
+    body = sofascore_get(f"team/{int(team_id)}/events/last/0")
+    events = body.get("events", [])
+    rows = []
+    for event in events:
+        status = (event.get("status") or {}).get("type", "")
+        if status != "finished":
+            continue
+        home = event.get("homeTeam") or {}
+        away = event.get("awayTeam") or {}
+        hs = (event.get("homeScore") or {}).get("current")
+        aws = (event.get("awayScore") or {}).get("current")
+        if hs is None or aws is None:
+            continue
+        if int(home.get("id", -1)) == int(team_id):
+            rows.append((float(hs), float(aws)))
+        elif int(away.get("id", -1)) == int(team_id):
+            rows.append((float(aws), float(hs)))
+        if len(rows) >= count:
+            break
+    if not rows:
+        raise RuntimeError("SofaScore did not return completed recent matches for this team.")
+    gf = sum(x[0] for x in rows) / len(rows)
+    ga = sum(x[1] for x in rows) / len(rows)
+    return round(gf, 3), round(ga, 3), len(rows), rows
+
+def fetch_sofascore_match(url):
+    """Fetch fixture names, last-six goal averages and H2H rows from a SofaScore match link."""
+    event_id = sofascore_event_id(url)
+    body = sofascore_get(f"event/{event_id}")
+    event = body.get("event") or {}
+    home = event.get("homeTeam") or {}
+    away = event.get("awayTeam") or {}
+    if not home.get("name") or not away.get("name"):
+        raise RuntimeError("The link did not return a recognizable football match.")
+    hgf, hga, hn, hrows = sofascore_recent_average(home["id"])
+    agf, aga, an, arows = sofascore_recent_average(away["id"])
+    h2h_rows = []
+    try:
+        duel = sofascore_get(f"event/{event_id}/h2h")
+        for item in (duel.get("events") or [])[:10]:
+            ht = (item.get("homeTeam") or {}).get("name", "Home")
+            at = (item.get("awayTeam") or {}).get("name", "Away")
+            hs = (item.get("homeScore") or {}).get("current", "?")
+            aws = (item.get("awayScore") or {}).get("current", "?")
+            h2h_rows.append(f"{ht} {hs}-{aws} {at}")
+    except Exception:
+        pass
+    return {
+        "event_id": event_id,
+        "home": {"name": home["name"], "gf": hgf, "ga": hga, "sample_size": hn, "elo": None, "avg_opp_elo": 1750.0, "absences": []},
+        "away": {"name": away["name"], "gf": agf, "ga": aga, "sample_size": an, "elo": None, "avg_opp_elo": 1750.0, "absences": []},
+        "h2h": h2h_rows,
+        "event_name": f"{home['name']} vs {away['name']}",
+        "status": (event.get("status") or {}).get("description", "Unknown"),
+        "start_timestamp": event.get("startTimestamp"),
+        "home_recent": hrows, "away_recent": arows,
+    }
+
 # ---------------- API-Football Live Data Engine ----------------
 def get_api_key():
     if st.session_state.get('api_key'):
@@ -460,7 +602,7 @@ with st.sidebar:
 
 # ---------------- Main UI & Tabs ----------------
 st.title("⚽ Football Match Lab V5.1 — Unified Calibrated Engine")
-st.caption("Strict Validation • Manual / Structured Block / Live API Modes • Vectorized Dixon-Coles • Brier Calibration")
+st.caption("Strict Validation • Manual / Block / SofaScore URL / Live API • Vectorized Dixon-Coles • Market Settlement Tracking")
 
 tabs = st.tabs([
     "📥 1. Match Input (Manual / Block / API)",
@@ -476,6 +618,7 @@ with tabs[0]:
         [
             "Structured JSON / Match Block Paste",
             "Manual Form Builder",
+            "SofaScore Match URL Import",
             "API-Football Live Fetch"
         ],
         horizontal=True
@@ -614,7 +757,71 @@ with tabs[0]:
                 execute_and_save_model(valid_obj, "Manual Form", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val)
                 st.success(f"✅ Simulation Complete for **{valid_obj['home']['name']} vs {valid_obj['away']['name']}**! Open Tab 2 for full results.")
 
-    # --- MODE C: API-FOOTBALL LIVE FETCH ---
+    # --- MODE C: SOFASCORE MATCH URL IMPORT ---
+    elif input_mode == "SofaScore Match URL Import":
+        st.subheader("Import Match Data from a SofaScore Link")
+        st.caption("Automatically imports team names, recent completed-match GF/GA averages and H2H when available. Elo ratings and bookmaker odds are not reliably supplied by this import, so you must enter them yourself.")
+        sofa_url = st.text_input("Paste the full SofaScore match URL", placeholder="https://www.sofascore.com/football/match/...")
+        if st.button("🔎 Fetch Match Information from SofaScore", type="primary", use_container_width=True):
+            try:
+                st.session_state["sofascore_import"] = fetch_sofascore_match(sofa_url.strip())
+                st.success("SofaScore match data retrieved. Review the information below.")
+            except Exception as exc:
+                st.error(f"Could not import this SofaScore link: {exc}")
+
+        sofa_data = st.session_state.get("sofascore_import")
+        if sofa_data:
+            st.markdown(f"### {sofa_data['event_name']}")
+            st.caption(f"Fixture status: {sofa_data['status']} • Event ID: {sofa_data['event_id']}")
+            s1, s2 = st.columns(2)
+            with s1:
+                st.markdown(f"**{sofa_data['home']['name']} — recent {sofa_data['home']['sample_size']} matches**")
+                st.write(f"Goals scored per match: **{sofa_data['home']['gf']:.2f}**")
+                st.write(f"Goals conceded per match: **{sofa_data['home']['ga']:.2f}**")
+            with s2:
+                st.markdown(f"**{sofa_data['away']['name']} — recent {sofa_data['away']['sample_size']} matches**")
+                st.write(f"Goals scored per match: **{sofa_data['away']['gf']:.2f}**")
+                st.write(f"Goals conceded per match: **{sofa_data['away']['ga']:.2f}**")
+            if sofa_data["h2h"]:
+                with st.expander("SofaScore H2H results"):
+                    for item in sofa_data["h2h"]:
+                        st.write("- " + item)
+            else:
+                st.info("H2H results were not available from this SofaScore endpoint.")
+
+            st.warning("Please enter the teams' Elo ratings and decimal 1X2 odds. These are not guessed or silently filled by SofaScore import.")
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                sofa_home_elo = st.number_input(f"{sofa_data['home']['name']} Elo", min_value=800.0, max_value=2600.0, value=None, step=5.0, key="sofa_home_elo")
+            with ec2:
+                sofa_away_elo = st.number_input(f"{sofa_data['away']['name']} Elo", min_value=800.0, max_value=2600.0, value=None, step=5.0, key="sofa_away_elo")
+            oo1, oo2, oo3 = st.columns(3)
+            with oo1:
+                sofa_odd_h = st.number_input("Home odds (1)", min_value=1.01, max_value=100.0, value=None, step=0.05, key="sofa_odd_h")
+            with oo2:
+                sofa_odd_d = st.number_input("Draw odds (X)", min_value=1.01, max_value=100.0, value=None, step=0.05, key="sofa_odd_d")
+            with oo3:
+                sofa_odd_a = st.number_input("Away odds (2)", min_value=1.01, max_value=100.0, value=None, step=0.05, key="sofa_odd_a")
+
+            if st.button("⚽ Run Simulation with Imported Data", type="primary", use_container_width=True):
+                payload = {
+                    "home": dict(sofa_data["home"]),
+                    "away": dict(sofa_data["away"]),
+                    "odds": {"home": sofa_odd_h, "draw": sofa_odd_d, "away": sofa_odd_a},
+                    "h2h": sofa_data["h2h"],
+                }
+                payload["home"]["elo"] = sofa_home_elo
+                payload["away"]["elo"] = sofa_away_elo
+                valid, errors = validate_match_payload(payload)
+                if errors:
+                    st.error("Please complete the missing required fields:")
+                    for error in errors:
+                        st.write("- " + error)
+                else:
+                    execute_and_save_model(valid, "SofaScore URL", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, fixture_id=sofa_data["event_id"])
+                    st.success(f"Simulation completed: {sofa_data['event_name']}. Open Tab 2 for results.")
+
+    # --- MODE D: API-FOOTBALL LIVE FETCH ---
     else:
         st.subheader("API-Football Automatic Senior-Team Pipeline")
         st.caption("Fetches real recent GF/GA and confirmed injury lists via API-Football, combined with your Elo & odds inputs.")
@@ -803,12 +1010,14 @@ with tabs[3]:
             fin_a = sc2.number_input("Final Away Goals", min_value=0, max_value=25, value=0)
 
             if st.button("💾 Save Final Score & Update Accuracy"):
+                settled_time = datetime.now().strftime("%Y-%m-%d %H:%M")
                 with db() as con:
                     con.execute(
                         "UPDATE predictions SET actual_home = ?, actual_away = ?, settled_at = ? WHERE id = ?",
-                        (int(fin_h), int(fin_a), datetime.now().strftime("%Y-%m-%d %H:%M"), opts[choice])
+                        (int(fin_h), int(fin_a), settled_time, opts[choice])
                     )
-                st.success("Result settled!")
+                settle_market_records(opts[choice], int(fin_h), int(fin_a), settled_time)
+                st.success("Result and all three goal markets settled!")
                 st.rerun()
 
         settled = [r for r in rows if r['actual_home'] is not None]
@@ -824,3 +1033,79 @@ with tabs[3]:
                 f"{np.mean(brier_vals):.4f}",
                 delta=f"{len(settled)} settled matches"
             )
+
+        # ---------------- Individual Market Tracking ----------------
+        st.divider()
+        st.markdown("### Individual Market Performance")
+        st.caption("Each settled match is scored separately for Over 1.5, Over 2.5 and BTTS. The selected side is the more likely side from the model (Yes or No).")
+        with db() as con:
+            market_rows = con.execute("SELECT * FROM market_settlements ORDER BY prediction_id DESC, market").fetchall()
+        if market_rows:
+            market_df = pd.DataFrame([dict(r) for r in market_rows])
+            summary_rows = []
+            for market_name in ["Over 1.5", "Over 2.5", "BTTS"]:
+                part = market_df[market_df["market"] == market_name].copy()
+                if part.empty:
+                    continue
+                wins = int((part["result"] == "WIN").sum())
+                losses = int((part["result"] == "LOSS").sum())
+                # Binary Brier score uses the model's probability of the Yes outcome.
+                brier = float(np.mean((part["predicted_yes_probability"] - part["actual_yes"]) ** 2))
+                summary_rows.append({
+                    "Market": market_name,
+                    "Settled": len(part),
+                    "Wins": wins,
+                    "Losses": losses,
+                    "Selection Win Rate": f"{wins / len(part):.1%}",
+                    "Binary Brier (lower is better)": f"{brier:.4f}"
+                })
+            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+            st.markdown("#### Confidence Calibration by Market")
+            calibration_rows = []
+            for market_name in ["Over 1.5", "Over 2.5", "BTTS"]:
+                part = market_df[market_df["market"] == market_name].copy()
+                if part.empty:
+                    continue
+                part["confidence_band"] = pd.cut(
+                    part["selected_probability"],
+                    bins=[0.499999, 0.60, 0.70, 0.80, 0.90, 1.000001],
+                    labels=["50–60%", "60–70%", "70–80%", "80–90%", "90–100%"],
+                    include_lowest=True
+                )
+                for band, group in part.groupby("confidence_band", observed=False):
+                    if len(group) == 0:
+                        continue
+                    calibration_rows.append({
+                        "Market": market_name,
+                        "Confidence Band": str(band),
+                        "Predictions": len(group),
+                        "Average Predicted Confidence": f"{group['selected_probability'].mean():.1%}",
+                        "Actual Win Rate": f"{(group['result'] == 'WIN').mean():.1%}"
+                    })
+            if calibration_rows:
+                st.dataframe(pd.DataFrame(calibration_rows), hide_index=True, use_container_width=True)
+
+            st.markdown("#### Individual Market Betting History")
+            display_market = market_df.merge(
+                df_hist[["id", "created_at", "home", "away"]],
+                left_on="prediction_id", right_on="id", how="left"
+            )
+            st.dataframe(
+                display_market[["prediction_id", "created_at", "home", "away", "market", "selection", "selected_probability", "actual_yes", "result"]].rename(columns={
+                    "prediction_id": "Prediction ID",
+                    "created_at": "Date",
+                    "home": "Home",
+                    "away": "Away",
+                    "market": "Market",
+                    "selection": "Selection",
+                    "selected_probability": "Confidence",
+                    "actual_yes": "Actual Yes (1/0)",
+                    "result": "Result"
+                }).style.format({"Confidence": "{:.1%}"}),
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.info("No settled market records yet. Settle a completed match above to start market-by-market tracking.")
+
