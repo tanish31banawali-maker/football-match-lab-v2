@@ -6,9 +6,11 @@ import json
 import math
 import os
 import re
+import shutil
 import urllib.parse
 import requests
 from datetime import datetime
+from contextlib import contextmanager
 
 try:
     from PIL import Image
@@ -25,16 +27,42 @@ DB_PATH = os.path.join(APP_DIR, 'football_lab_v5_1.db')
 API_BASE = 'https://v3.football.api-sports.io'
 
 st.set_page_config(
-    page_title='Football Match Lab V5.2 + Screenshot Import & Ratings',
+    page_title='Football Match Lab V6.1 Advanced Prediction & Risk Analysis',
     page_icon='⚽',
     layout='wide',
     initial_sidebar_state='expanded'
 )
 
+@contextmanager
 def db():
+    """Connection context that commits/rolls back and always closes SQLite."""
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
-    return con
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+def backup_existing_database():
+    """Create one consistent pre-upgrade SQLite backup without touching history."""
+    if not os.path.exists(DB_PATH):
+        return None
+    backup_path = DB_PATH + '.pre_v6_backup'
+    if os.path.exists(backup_path):
+        return backup_path
+    source = sqlite3.connect(DB_PATH)
+    target = sqlite3.connect(backup_path)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+    return backup_path
+
 
 def init_db():
     with db() as con:
@@ -72,7 +100,8 @@ def init_db():
         }
         for column in (
             "home_attributes_json", "away_attributes_json",
-            "home_players_json", "away_players_json"
+            "home_players_json", "away_players_json",
+            "match_context_json", "home_form_json", "away_form_json"
         ):
             if column not in existing_columns:
                 con.execute(f"ALTER TABLE predictions ADD COLUMN {column} TEXT")
@@ -120,7 +149,7 @@ def settle_market_records(prediction_id, home_goals, away_goals, settled_at=None
                 selected_probability=excluded.selected_probability,
                 actual_yes=excluded.actual_yes,
                 result=excluded.result,
-                settled_at=excluded.settled_at''',
+                settled_at=COALESCE(market_settlements.settled_at, excluded.settled_at)''',
                 (int(prediction_id), market, selection, p_yes, selected_probability,
                  int(actual_yes), "WIN" if won else "LOSS", settled_at))
 
@@ -132,6 +161,7 @@ def backfill_market_settlements():
     for row in old_rows:
         settle_market_records(row["id"], row["actual_home"], row["actual_away"])
 
+backup_existing_database()
 init_db()
 backfill_market_settlements()
 
@@ -258,12 +288,14 @@ def calculate_expected_goals(data, elo_weight=0.35):
     ma *= attribute_attack_factor(a) * attribute_defence_factor(h)
 
     # Role-based & importance-weighted absence impact
-    imp_weights = {'star': 0.06, 'starter': 0.035, 'rotation': 0.015}
+    imp_weights = {'star': 0.065, 'starter': 0.035, 'rotation': 0.012}
+    status_weights = {'injured': 1.0, 'suspended': 1.0, 'doubtful': 0.45, 'unknown': 0.0, 'available': 0.0}
 
     def calc_absence_effects(absences):
         att_pen, def_leak = 0.0, 0.0
         for ab in absences:
             w = imp_weights.get(str(ab.get('importance', 'starter')).lower(), 0.035)
+            w *= status_weights.get(str(ab.get('status', 'injured')).lower(), 0.0)
             pos = str(ab.get('position', 'MID')).upper()
             if pos in ('FWD', 'ST', 'ATT', 'FORWARD'):
                 att_pen += w
@@ -386,125 +418,167 @@ def parse_number_after_colon(line):
     m = re.search(r'^-?\d+(?:\.\d+)?', after)
     return float(m.group(0)) if m else None
 
+def _normalise_absence_position(value):
+    v = str(value or '').strip().lower()
+    if any(x in v for x in ('goalkeeper', 'keeper', ' gk', 'gk')): return 'GK'
+    if any(x in v for x in ('defender', 'defence', 'defense', 'back', 'centre-back', 'center-back', 'cb', 'lb', 'rb')): return 'DEF'
+    if re.search(r'\b(forward|striker|winger|attacker|fwd|st)\b', v): return 'FWD'
+    if any(x in v for x in ('midfielder', 'midfield', ' mid', ' dm', ' cm', ' am')): return 'MID'
+    return 'MID'
+
+def _normalise_absence_importance(value):
+    v = str(value or '').strip().lower()
+    if re.search(r'\b(star|key|world class)\b', v): return 'star'
+    if re.search(r'\b(rotation|backup|bench)\b', v): return 'rotation'
+    return 'starter'
+
+def _normalise_absence_status(value):
+    v = str(value or '').strip().lower()
+    if any(x in v for x in ('doubt', 'questionable', 'late test', '50/50')): return 'doubtful'
+    if any(x in v for x in ('suspend', 'banned', 'red card')): return 'suspended'
+    if any(x in v for x in ('injur', 'out', 'unavailable', 'ruled out', 'not available')): return 'injured'
+    if any(x in v for x in ('available', 'fit', 'returned', 'back in training')): return 'available'
+    return 'unknown'
+
+def _parse_absence_line(line):
+    """Accept pipe, comma, dash and parenthesised absence formats."""
+    raw = line.strip().lstrip('-*• ').strip()
+    if not raw: return None
+    parts = [x.strip() for x in re.split(r'\s*\|\s*|\s*;\s*|\s*,\s*', raw) if x.strip()]
+    if len(parts) >= 2:
+        player = parts[0]
+        joined = ' '.join(parts[1:])
+        position = _normalise_absence_position(joined)
+        importance = _normalise_absence_importance(joined)
+        status = _normalise_absence_status(joined)
+    else:
+        player = re.split(r'\s+[—–-]\s+|\s*\(', raw, maxsplit=1)[0].strip()
+        position = _normalise_absence_position(raw)
+        importance = _normalise_absence_importance(raw)
+        status = _normalise_absence_status(raw)
+    if not player or player.lower() in {'player', 'none', 'n/a', 'no absences', 'nil'}:
+        return None
+    return {'player': player, 'position': position, 'importance': importance, 'status': status}
+
 def parse_structured_text_block(raw_text):
+    """Robust parser for JSON and human-written match blocks.
+
+    Supports explicit Home/Away team fields, standalone team headings, sectioned
+    absences, pipe-delimited player rows, comma/dash formats, and common odds labels.
+    It never invents missing numeric inputs or bookmaker odds.
     """
-    Strict parser for sectioned match blocks. Starts every field as None,
-    reads strictly after colons, uses word boundaries, and resets sections cleanly.
-    """
-    text = raw_text.strip()
+    text = str(raw_text or '').strip()
+    if not text:
+        return None, ['Input block is empty.']
     if text.startswith('{'):
         try:
             obj = json.loads(text)
+            # Normalise JSON absence rows as well as text rows.
+            for side in ('home', 'away'):
+                if isinstance(obj.get(side), dict):
+                    fixed=[]
+                    for item in obj[side].get('absences', []) or []:
+                        if isinstance(item, dict):
+                            fixed.append({
+                                'player': str(item.get('player', item.get('name', ''))).strip(),
+                                'position': _normalise_absence_position(item.get('position')),
+                                'importance': _normalise_absence_importance(item.get('importance')),
+                                'status': _normalise_absence_status(item.get('status', 'injured')),
+                            })
+                    obj[side]['absences'] = fixed
             return validate_match_payload(obj)
         except json.JSONDecodeError as e:
-            return None, [f"JSON syntax error: {e}"]
+            return None, [f'JSON syntax error: {e}']
 
     payload = {
         'home': {'name': None, 'gf': None, 'ga': None, 'elo': None, 'sample_size': 6, 'avg_opp_elo': 1750.0, 'absences': []},
         'away': {'name': None, 'gf': None, 'ga': None, 'elo': None, 'sample_size': 6, 'avg_opp_elo': 1750.0, 'absences': []},
-        'odds': {'home': None, 'draw': None, 'away': None},
-        'h2h': []
+        'odds': {'home': None, 'draw': None, 'away': None}, 'h2h': []
     }
-
+    side = None
     section = None
-    active_side = None
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-    for ln in lines:
-        low = ln.lower()
-
-        # Reset section headers explicitly
-        if re.match(r'^(1\.|2\.|3\.|4\.|5\.|6\.)', low) or low.startswith('---'):
-            section = None
-            active_side = None
-            if 'base goal' in low or 'performance' in low or 'ratings' in low:
-                section = 'stats'
-            elif 'lineup' in low or 'formation' in low:
-                section = 'lineups'
-            elif 'absence' in low or 'injur' in low:
-                section = 'absences'
-            elif 'head-to-head' in low or re.search(r'\bh2h\b', low):
-                section = 'h2h'
-            elif 'odds' in low or 'market' in low:
-                section = 'odds'
+    for original in text.splitlines():
+        line = original.strip()
+        if not line or line.startswith('```'):
             continue
-
-        # Explicit team declarations
-        if re.match(r'^home\s*team\s*:', low):
-            payload['home']['name'] = ln.split(':', 1)[1].strip()
-            active_side = 'home'
+        low = line.lower().strip(' :')
+        # Side-specific section labels, including the format previously rejected.
+        m = re.match(r'^(home|away)\s+(absences?|injuries|injured|unavailable|team news)\s*:?$', line, re.I)
+        if m:
+            side, section = m.group(1).lower(), 'absences'
             continue
-        if re.match(r'^away\s*team\s*:', low):
-            payload['away']['name'] = ln.split(':', 1)[1].strip()
-            active_side = 'away'
+        m = re.match(r'^(home|away)\s+(team)\s*:\s*(.+)$', line, re.I)
+        if m:
+            side = m.group(1).lower(); payload[side]['name'] = m.group(3).strip(); section = 'stats'; continue
+        m = re.match(r'^(home|away)\s+(gf|ga|elo|matches sample size|sample size|avg opponent elo)\s*:\s*(.+)$', line, re.I)
+        if m:
+            side = m.group(1).lower(); key=m.group(2).lower(); val=parse_number_after_colon(line)
+            field={'gf':'gf','ga':'ga','elo':'elo','matches sample size':'sample_size','sample size':'sample_size','avg opponent elo':'avg_opp_elo'}[key]
+            if val is not None: payload[side][field] = int(val) if field == 'sample_size' else val
+            section='stats'; continue
+        # Common block headings
+        if re.match(r'^(home|away)\s+absences\s*:', line, re.I):
+            side=re.match(r'^(home|away)', line, re.I).group(1).lower(); section='absences'; continue
+        if re.match(r'^(home|away)\s+team\s*:', line, re.I):
             continue
-
-        # Detect standalone team subheaders inside stats or absences
-        if ':' not in ln and not ln.startswith(('-', '*')) and section in ('stats', 'absences', None):
-            cand = ln.strip()
-            if payload['home']['name'] is None:
-                payload['home']['name'] = cand
-                active_side = 'home'
-                continue
-            elif payload['away']['name'] is None and cand.lower() != payload['home']['name'].lower():
-                payload['away']['name'] = cand
-                active_side = 'away'
-                continue
-            elif payload['home']['name'] and cand.lower() == payload['home']['name'].lower():
-                active_side = 'home'
-                continue
-            elif payload['away']['name'] and cand.lower() == payload['away']['name'].lower():
-                active_side = 'away'
-                continue
-
-        # Parse Stats (strictly after colon + word boundaries)
-        if active_side in ('home', 'away') and ':' in ln and section in ('stats', None):
-            if re.search(r'\b(gf|goals\s+scored)\b', low):
-                val = parse_number_after_colon(ln)
-                if val is not None:
-                    payload[active_side]['gf'] = val
-                continue
-            if re.search(r'\b(ga|goals\s+conceded)\b', low):
-                val = parse_number_after_colon(ln)
-                if val is not None:
-                    payload[active_side]['ga'] = val
-                continue
-            if re.search(r'\belo\b', low):
-                val = parse_number_after_colon(ln)
-                if val is not None:
-                    payload[active_side]['elo'] = val
-                continue
-
-        # Parse Absences (only while inside absences section and active_side is known)
-        if section == 'absences' and active_side in ('home', 'away') and ln.startswith(('-', '*')):
-            item_txt = ln.lstrip('-* ').strip()
-            pos = 'MID'
-            if re.search(r'\b(fwd|forward|striker|st|att)\b', item_txt, re.I):
-                pos = 'FWD'
-            elif re.search(r'\b(def|defender|gk|goalkeeper)\b', item_txt, re.I):
-                pos = 'DEF'
-            imp = 'star' if re.search(r'\bstar\b', item_txt, re.I) else 'starter'
-            player_name = re.split(r'\(|–|-', item_txt)[0].strip()
-            payload[active_side]['absences'].append({'player': player_name, 'position': pos, 'importance': imp})
+        # A standalone team heading selects side while in a stats/absence block.
+        if ':' not in line and not line.startswith(('-', '*', '•')):
+            candidate=line.strip()
+            if candidate.lower() in {'home absences','away absences','home injuries','away injuries'}:
+                side=candidate.split()[0].lower(); section='absences'; continue
+            if payload['home']['name'] and candidate.lower()==payload['home']['name'].lower(): side='home'; continue
+            if payload['away']['name'] and candidate.lower()==payload['away']['name'].lower(): side='away'; continue
+            if section is None and payload['home']['name'] is None:
+                payload['home']['name']=candidate; side='home'; section='stats'; continue
+            if section is None and payload['away']['name'] is None:
+                payload['away']['name']=candidate; side='away'; section='stats'; continue
+        # Odds lines terminate an active absence section; otherwise they could
+        # accidentally be interpreted as player names.
+        if re.match(r'^(home odds|draw odds|away odds|odds\s*[1x2])\s*:', line, re.I):
+            section = 'odds'
+        # Absence rows: parse while in absence section, and also accept explicit
+        # 'Player | Position | Importance | Status' rows beneath team headers.
+        if section == 'absences' and side in ('home','away'):
+            item = _parse_absence_line(line)
+            if item: payload[side]['absences'].append(item)
             continue
-
-        # Parse H2H
-        if section == 'h2h' and ln.startswith(('-', '*')):
-            payload['h2h'].append(ln.lstrip('-* ').strip())
+        # Inline absence declarations such as 'Home Absences: Player | DEF | Star | Injured'
+        inline = re.match(r'^(home|away)\s+(?:absences?|injuries)\s*:\s*(.+)$', line, re.I)
+        if inline:
+            side=inline.group(1).lower(); section='absences'
+            item=_parse_absence_line(inline.group(2))
+            if item: payload[side]['absences'].append(item)
             continue
-
-        # Parse Explicit Odds Labels
-        if ':' in ln and (section == 'odds' or re.search(r'\bodds\b', low)):
-            val = parse_number_after_colon(ln)
+        # Stats labels with or without 'Avg' and common variants.
+        if side in ('home','away') and ':' in line:
+            val=parse_number_after_colon(line)
             if val is not None:
-                if re.search(r'\b(home\s*odds|odds\s*1)\b', low):
-                    payload['odds']['home'] = val
-                elif re.search(r'\b(draw\s*odds|odds\s*x)\b', low):
-                    payload['odds']['draw'] = val
-                elif re.search(r'\b(away\s*odds|odds\s*2)\b', low):
-                    payload['odds']['away'] = val
-
-    return validate_match_payload(payload)
+                if re.search(r'\b(gf|avg\.?\s*goals?\s*scored|goals?\s*scored)\b', low): payload[side]['gf']=val; continue
+                if re.search(r'\b(ga|avg\.?\s*goals?\s*conceded|goals?\s*conceded)\b', low): payload[side]['ga']=val; continue
+                if re.search(r'\belo\b', low): payload[side]['elo']=val; continue
+                if re.search(r'\b(sample size|matches sample size)\b', low): payload[side]['sample_size']=int(val); continue
+                if re.search(r'\b(avg opponent elo|opponent elo)\b', low): payload[side]['avg_opp_elo']=val; continue
+        # Odds labels work regardless of whether an Odds heading exists.
+        if ':' in line:
+            val=parse_number_after_colon(line)
+            if val is not None:
+                if re.search(r'\b(home odds|odds\s*1)\b', low): payload['odds']['home']=val; continue
+                if re.search(r'\b(draw odds|odds\s*x)\b', low): payload['odds']['draw']=val; continue
+                if re.search(r'\b(away odds|odds\s*2)\b', low): payload['odds']['away']=val; continue
+        if low in {'odds','bookmaker odds','market odds'}:
+            section='odds'; continue
+        if section == 'odds' and ':' in line:
+            val=parse_number_after_colon(line)
+            if val is not None:
+                if re.search(r'\b(home|1)\b', low): payload['odds']['home']=val
+                elif re.search(r'\b(draw|x)\b', low): payload['odds']['draw']=val
+                elif re.search(r'\b(away|2)\b', low): payload['odds']['away']=val
+    # Add actionable parser diagnostics when absences were mentioned but no rows parsed.
+    errors=[]
+    if re.search(r'\b(absences?|injuries|injured|suspended)\b', text, re.I) and not (payload['home']['absences'] or payload['away']['absences']):
+        errors.append('Absence section was detected but no player rows were parsed. Use: Player | Position | Importance | Status.')
+    valid, validation_errors = validate_match_payload(payload)
+    return valid, errors + validation_errors
 
 
 # ---------------- SofaScore Match-Link Import ----------------
@@ -731,7 +805,7 @@ def fetch_team_injuries_api(fixture_id, home_id, away_id, key):
         tid = item.get('team', {}).get('id')
         pname = item.get('player', {}).get('name', 'Unknown')
         ptype = item.get('player', {}).get('type', 'MID')
-        entry = {'player': pname, 'position': ptype[:3].upper(), 'importance': 'starter'}
+        entry = {'player': pname, 'position': ptype[:3].upper(), 'importance': 'starter', 'status': 'injured'}
         if tid == home_id:
             h_abs.append(entry)
         elif tid == away_id:
@@ -753,8 +827,9 @@ def execute_and_save_model(payload, source_mode, neutral_venue, home_adv, rho, e
             (created_at, source_mode, fixture_id, home, away, neutral_venue,
              p_home, p_draw, p_away, p_over15, p_over25, p_over35, p_btts,
              exp_home, exp_away, odd_h, odd_d, odd_a,
-             home_attributes_json, away_attributes_json, home_players_json, away_players_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+             home_attributes_json, away_attributes_json, home_players_json, away_players_json,
+             match_context_json, home_form_json, away_form_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (datetime.now().strftime("%Y-%m-%d %H:%M"), source_mode, fixture_id,
              payload['home']['name'], payload['away']['name'], int(neutral_venue),
              res['p_home'], res['p_draw'], res['p_away'],
@@ -764,13 +839,16 @@ def execute_and_save_model(payload, source_mode, neutral_venue, home_adv, rho, e
              json.dumps(payload['home'].get('attributes', {}), ensure_ascii=False),
              json.dumps(payload['away'].get('attributes', {}), ensure_ascii=False),
              json.dumps(payload['home'].get('player_ratings', []), ensure_ascii=False),
-             json.dumps(payload['away'].get('player_ratings', []), ensure_ascii=False))
+             json.dumps(payload['away'].get('player_ratings', []), ensure_ascii=False),
+             json.dumps(payload.get('match_context', {}), ensure_ascii=False),
+             json.dumps({"recent_form": payload['home'].get('recent_form', []), "additional_stats": payload['home'].get('additional_stats', {}), "tactics": payload['home'].get('tactics', {}), "sample_scope": payload['home'].get('sample_scope'), "absences": payload['home'].get('absences', [])}, ensure_ascii=False),
+             json.dumps({"recent_form": payload['away'].get('recent_form', []), "additional_stats": payload['away'].get('additional_stats', {}), "tactics": payload['away'].get('tactics', {}), "sample_scope": payload['away'].get('sample_scope'), "absences": payload['away'].get('absences', [])}, ensure_ascii=False))
         )
 
 # ---------------- Sidebar Controls ----------------
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/football-ball-1.png", width=64)
-    st.title("Match Lab V5.1")
+    st.title("Match Lab V6.1")
 
     api_key_input = st.text_input("API-Football Key (For Live API Mode)", type="password", value=get_api_key())
     st.session_state['api_key'] = api_key_input
@@ -791,8 +869,8 @@ with st.sidebar:
     st.caption("More runs reduce simulation noise but do not guarantee more accurate predictions.")
 
 # ---------------- Main UI & Tabs ----------------
-st.title("⚽ Football Match Lab V5.2 — Screenshot Import & Attribute Ratings")
-st.caption("Screenshot OCR + Editable Review • Team & Player Ratings • SofaScore / API • Market Settlement Tracking")
+st.title("⚽ Football Match Lab V6.1 — Manual-First Match Simulation")
+st.caption("Manual-first builder • Lineups & tactical context • Screenshot/API imports • Odds analysis • Historical tracking")
 
 tabs = st.tabs([
     "📥 1. Match Input (Manual / Block / API)",
@@ -819,8 +897,8 @@ with tabs[0]:
 
     # --- MODE A: STRUCTURED BLOCK / JSON PASTE ---
     if input_mode == "Structured JSON / Match Block Paste":
-        st.subheader("Paste JSON or Strict Sectioned Match Block")
-        st.caption("No hidden defaults. Missing or 'Unverified' fields will be rejected with an exact error list, and valid inputs will trigger the simulation automatically.")
+        st.subheader("Paste JSON or Flexible Match Block")
+        st.caption("Accepts Home/Away GF, GA, Elo, odds and flexible absence rows such as Player | Position | Importance | Status. Missing core numeric data is still rejected.")
 
         template_json = """{
   "home": {
@@ -870,98 +948,148 @@ with tabs[0]:
 
     # --- MODE B: MANUAL FORM BUILDER ---
     elif input_mode == "Manual Form Builder":
-        st.subheader("Manual Match Entry Form")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("### 🏠 Home Team")
-            m_h_name = st.text_input("Home Team Name", value="")
-            m_h_gf = st.number_input("Home Avg Goals Scored (GF)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.80")
-            m_h_ga = st.number_input("Home Avg Goals Conceded (GA)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.05")
-            m_h_elo = st.number_input("Home Elo Rating", min_value=800.0, max_value=2600.0, value=None, step=5.0, placeholder="e.g. 1850")
-            m_h_sample = st.number_input("Home Matches Sample Size", min_value=1, max_value=50, value=6)
-            m_h_opp_elo = st.number_input("Home Avg Opponent Elo", min_value=800.0, max_value=2600.0, value=1750.0, step=10.0)
+        st.subheader("V6 Manual Match Builder")
+        st.caption("Manual-first workflow. Enter verified information; optional fields can stay blank. Tactical and player details are saved for review but are not converted into uncalibrated probability multipliers.")
 
-        with c2:
-            st.markdown("### ✈️ Away Team")
-            m_a_name = st.text_input("Away Team Name", value="")
-            m_a_gf = st.number_input("Away Avg Goals Scored (GF)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.50")
-            m_a_ga = st.number_input("Away Avg Goals Conceded (GA)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.20")
-            m_a_elo = st.number_input("Away Elo Rating", min_value=800.0, max_value=2600.0, value=None, step=5.0, placeholder="e.g. 1810")
-            m_a_sample = st.number_input("Away Matches Sample Size", min_value=1, max_value=50, value=6)
-            m_a_opp_elo = st.number_input("Away Avg Opponent Elo", min_value=800.0, max_value=2600.0, value=1750.0, step=10.0)
+        team_tabs = st.tabs(["🏠 Home Team", "✈️ Away Team", "⚔️ Match Context", "💰 Odds & Run"])
+        team_payload = {}
+        team_rating_payload = {}
+        team_squad_payload = {}
+        team_form_payload = {}
+        team_absence_payload = {}
 
-        st.markdown("### 🏥 Role-Based Key Absences")
-        ac1, ac2 = st.columns(2)
-        with ac1:
-            st.caption("Home Absences")
-            h_abs_df = st.data_editor(
-                pd.DataFrame(columns=["player", "position", "importance"]),
-                column_config={
-                    "position": st.column_config.SelectboxColumn("Position", options=["FWD", "MID", "DEF", "GK"], required=True),
-                    "importance": st.column_config.SelectboxColumn("Importance", options=["star", "starter", "rotation"], required=True),
-                },
-                num_rows="dynamic",
-                key="manual_h_abs",
-                use_container_width=True
-            )
-        with ac2:
-            st.caption("Away Absences")
-            a_abs_df = st.data_editor(
-                pd.DataFrame(columns=["player", "position", "importance"]),
-                column_config={
-                    "position": st.column_config.SelectboxColumn("Position", options=["FWD", "MID", "DEF", "GK"], required=True),
-                    "importance": st.column_config.SelectboxColumn("Importance", options=["star", "starter", "rotation"], required=True),
-                },
-                num_rows="dynamic",
-                key="manual_a_abs",
-                use_container_width=True
-            )
+        for side, tab, label in [("home", team_tabs[0], "Home"), ("away", team_tabs[1], "Away")]:
+            with tab:
+                st.markdown(f"### {label} team profile")
+                c1, c2 = st.columns(2)
+                with c1:
+                    name = st.text_input(f"{label} Team Name", key=f"v6_{side}_name")
+                    gf = st.number_input(f"{label} Avg Goals Scored (GF)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.65", key=f"v6_{side}_gf")
+                    elo = st.number_input(f"{label} Elo Rating", min_value=800.0, max_value=2600.0, value=None, step=5.0, placeholder="e.g. 1850", key=f"v6_{side}_elo")
+                    sample = st.number_input(f"{label} Matches in Statistical Sample", min_value=1, max_value=50, value=8, key=f"v6_{side}_sample")
+                with c2:
+                    ga = st.number_input(f"{label} Avg Goals Conceded (GA)", min_value=0.0, max_value=10.0, value=None, step=0.05, placeholder="e.g. 1.10", key=f"v6_{side}_ga")
+                    opp_elo = st.number_input(f"{label} Average Opponent Elo", min_value=800.0, max_value=2600.0, value=1750.0, step=10.0, key=f"v6_{side}_opp_elo")
+                    sample_scope = st.selectbox(f"{label} Statistical Sample", ["All competitions", "League only", "Home matches only", "Away matches only", "Last 5", "Last 10", "Last 15", "Custom sample"], key=f"v6_{side}_scope")
 
+                with st.expander(f"{label}: Additional performance statistics (optional)", expanded=True):
+                    st.caption("These are stored as context. The current goal model does not add them again on top of GF/GA, which could double-count the same performance.")
+                    stat_cols = st.columns(4)
+                    optional_stats = {}
+                    for i, (key, title, maximum) in enumerate([
+                        ("xg", "xG / match", 10.0), ("xga", "xGA / match", 10.0),
+                        ("shots", "Shots / match", 60.0), ("shots_on_target", "Shots on target / match", 30.0),
+                        ("big_chances", "Big chances / match", 30.0), ("big_chances_conceded", "Big chances conceded", 30.0),
+                        ("possession", "Possession %", 100.0), ("clean_sheets_pct", "Clean sheets %", 100.0)
+                    ]):
+                        optional_stats[key] = stat_cols[i % 4].number_input(f"{label} {title}", min_value=0.0, max_value=maximum, value=None, step=0.1, key=f"v6_{side}_{key}")
 
-        mr1, mr2 = st.columns(2)
-        with mr1:
-            manual_home_ratings = render_team_attribute_ratings("Manual Home")
-            manual_home_players = render_player_attribute_table("Manual Home")
-        with mr2:
-            manual_away_ratings = render_team_attribute_ratings("Manual Away")
-            manual_away_players = render_player_attribute_table("Manual Away")
+                with st.expander(f"{label}: Recent match log", expanded=False):
+                    st.caption("Enter recent matches if you have them. Keep the sample consistent and include opponent strength where possible.")
+                    form_df = st.data_editor(
+                        pd.DataFrame(columns=["date", "opponent", "venue", "gf", "ga", "xg", "xga", "opponent_elo"]),
+                        column_config={
+                            "venue": st.column_config.SelectboxColumn("Venue", options=["Home", "Away", "Neutral"]),
+                            **{k: st.column_config.NumberColumn(k.upper() if k in ["gf", "ga", "xg", "xga"] else k.replace("_", " ").title(), min_value=0.0, max_value=2600.0, step=0.1) for k in ["gf", "ga", "xg", "xga", "opponent_elo"]}
+                        }, num_rows="dynamic", key=f"v6_{side}_form", use_container_width=True
+                    )
+                    team_form_payload[side] = form_df.where(pd.notna(form_df), None).to_dict(orient="records")
 
-        st.markdown("### 💰 Bookmaker 1X2 Decimal Odds")
-        oc1, oc2, oc3 = st.columns(3)
-        m_odd_h = oc1.number_input("Home Odds (1)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 2.10")
-        m_odd_d = oc2.number_input("Draw Odds (X)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 3.40")
-        m_odd_a = oc3.number_input("Away Odds (2)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 3.50")
+                with st.expander(f"{label}: Tactics & formation", expanded=False):
+                    t1, t2, t3 = st.columns(3)
+                    formation = t1.selectbox(f"{label} Formation", ["Unknown", "4-3-3", "4-2-3-1", "4-4-2", "4-1-4-1", "3-4-2-1", "3-5-2", "3-4-3", "5-3-2", "Other"], key=f"v6_{side}_formation")
+                    style = t2.selectbox(f"{label} Playing Style", ["Unknown", "Possession", "High press", "Mid block", "Low block", "Counterattack", "Direct", "Balanced"], key=f"v6_{side}_style")
+                    press = t3.selectbox(f"{label} Pressing", ["Unknown", "Low", "Medium", "High", "Very high"], key=f"v6_{side}_press")
+                    t4, t5, t6 = st.columns(3)
+                    line = t4.selectbox(f"{label} Defensive Line", ["Unknown", "Low", "Medium", "High"], key=f"v6_{side}_line")
+                    set_piece = t5.selectbox(f"{label} Set-piece threat", ["Unknown", "Weak", "Average", "Strong"], key=f"v6_{side}_setpiece")
+                    transition = t6.selectbox(f"{label} Transition threat", ["Unknown", "Weak", "Average", "Strong"], key=f"v6_{side}_transition")
+                    tactics = {"formation": formation, "style": style, "pressing": press, "defensive_line": line, "set_piece": set_piece, "transition": transition}
 
-        if st.button("🚀 Validate Manual Form & Run Simulation", type="primary", use_container_width=True):
-            manual_payload = {
-                'home': {
-                    'name': m_h_name.strip() if m_h_name else None,
-                    'gf': m_h_gf, 'ga': m_h_ga, 'elo': m_h_elo,
-                    'sample_size': int(m_h_sample), 'avg_opp_elo': float(m_h_opp_elo),
-                    'absences': h_abs_df.dropna(subset=['player']).to_dict(orient='records')
-                },
-                'away': {
-                    'name': m_a_name.strip() if m_a_name else None,
-                    'gf': m_a_gf, 'ga': m_a_ga, 'elo': m_a_elo,
-                    'sample_size': int(m_a_sample), 'avg_opp_elo': float(m_a_opp_elo),
-                    'absences': a_abs_df.dropna(subset=['player']).to_dict(orient='records')
-                },
-                'odds': {'home': m_odd_h, 'draw': m_odd_d, 'away': m_odd_a}
+                with st.expander(f"{label}: Starting XI & substitutes", expanded=False):
+                    st.caption("Add the expected XI and bench. Ratings are user-entered context only; the model will not invent a player rating or apply an unsupported numerical impact.")
+                    squad_df = st.data_editor(
+                        pd.DataFrame(columns=["player", "position", "role", "rating_0_100", "fitness_0_100"]),
+                        column_config={
+                            "position": st.column_config.SelectboxColumn("Position", options=["GK", "CB", "LB", "RB", "DEF", "DM", "CM", "AM", "LM", "RM", "MID", "LW", "RW", "ST", "FWD"]),
+                            "role": st.column_config.SelectboxColumn("Role", options=["Starter", "Substitute", "Doubtful"]),
+                            "rating_0_100": st.column_config.NumberColumn("Rating (0–100)", min_value=0, max_value=100, step=1),
+                            "fitness_0_100": st.column_config.NumberColumn("Fitness (0–100)", min_value=0, max_value=100, step=1)
+                        }, num_rows="dynamic", key=f"v6_{side}_squad", use_container_width=True
+                    )
+                    team_squad_payload[side] = squad_df.dropna(subset=["player"]).to_dict(orient="records")
+
+                with st.expander(f"{label}: Injuries & suspensions", expanded=False):
+                    abs_df = st.data_editor(
+                        pd.DataFrame(columns=["player", "position", "importance", "status"]),
+                        column_config={
+                            "position": st.column_config.SelectboxColumn("Position", options=["FWD", "MID", "DEF", "GK"], required=True),
+                            "importance": st.column_config.SelectboxColumn("Importance", options=["star", "starter", "rotation"], required=True),
+                            "status": st.column_config.SelectboxColumn("Status", options=["injured", "suspended", "doubtful", "unknown", "available"], required=True)
+                        }, num_rows="dynamic", key=f"v6_{side}_absences", use_container_width=True
+                    )
+                    team_absence_payload[side] = abs_df.dropna(subset=["player"]).to_dict(orient="records")
+
+                team_rating_payload[side] = render_team_attribute_ratings(f"V6 {label}")
+                team_payload[side] = {
+                    "name": name.strip() if name else None, "gf": gf, "ga": ga, "elo": elo,
+                    "sample_size": int(sample), "avg_opp_elo": float(opp_elo),
+                    "sample_scope": sample_scope, "additional_stats": optional_stats,
+                    "tactics": tactics, "absences": team_absence_payload.get(side, [])
+                }
+
+        with team_tabs[2]:
+            st.markdown("### Match conditions")
+            mc1, mc2, mc3 = st.columns(3)
+            competition = mc1.text_input("Competition / League", key="v6_competition")
+            match_date = mc2.date_input("Match date", value=None, key="v6_match_date")
+            importance = mc3.selectbox("Match importance", ["Unknown", "Regular", "Derby", "Title race", "Relegation battle", "Cup knockout", "Final", "Must-win"])
+            cc1, cc2, cc3 = st.columns(3)
+            home_rest = cc1.number_input("Home rest days", min_value=0, max_value=30, value=7)
+            away_rest = cc2.number_input("Away rest days", min_value=0, max_value=30, value=7)
+            travel_km = cc3.number_input("Away travel distance (km, if known)", min_value=0, max_value=20000, value=None, step=50)
+            weather = st.selectbox("Weather", ["Unknown", "Clear", "Rain", "Heavy rain", "Windy", "Hot", "Cold", "Snow"])
+            venue_note = st.text_input("Venue / pitch notes (optional)")
+            match_context = {
+                "competition": competition, "match_date": str(match_date) if match_date else None,
+                "importance": importance, "home_rest_days": int(home_rest), "away_rest_days": int(away_rest),
+                "away_travel_km": travel_km, "weather": weather, "venue_notes": venue_note,
+                "neutral_venue": bool(neutral_venue)
             }
-            manual_payload = apply_attribute_ratings(
-                manual_payload,
-                manual_home_ratings, manual_away_ratings,
-                manual_home_players.dropna(subset=["player"]).to_dict(orient="records"),
-                manual_away_players.dropna(subset=["player"]).to_dict(orient="records")
-            )
-            valid_obj, errs = validate_match_payload(manual_payload)
-            if errs:
-                st.error("❌ Missing or Invalid Fields:")
-                for e in errs:
-                    st.write(f"- {e}")
-            else:
-                execute_and_save_model(valid_obj, "Manual Form", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, simulation_count=simulation_count)
-                st.success(f"✅ Simulation Complete for **{valid_obj['home']['name']} vs {valid_obj['away']['name']}**! Open Tab 2 for full results.")
+
+        with team_tabs[3]:
+            st.markdown("### Bookmaker 1X2 decimal odds")
+            st.caption("Odds are required by the existing EV comparison. Use the same bookmaker and record them close to kickoff when possible.")
+            oc1, oc2, oc3 = st.columns(3)
+            m_odd_h = oc1.number_input("Home Odds (1)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 2.10", key="v6_odd_h")
+            m_odd_d = oc2.number_input("Draw Odds (X)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 3.40", key="v6_odd_d")
+            m_odd_a = oc3.number_input("Away Odds (2)", min_value=1.01, max_value=100.0, value=None, step=0.05, placeholder="e.g. 3.50", key="v6_odd_a")
+            st.info("The current prediction engine remains a team-goal / Dixon–Coles model. Tactics, recent-match logs, weather and player ratings are saved with the prediction for audit, but are not given invented numerical effects. The existing GF/GA, Elo, team attributes and role-based absence logic remain the active inputs.")
+
+            if st.button("🚀 Validate Manual Builder & Run Simulation", type="primary", use_container_width=True):
+                manual_payload = {
+                    "home": dict(team_payload["home"]),
+                    "away": dict(team_payload["away"]),
+                    "odds": {"home": m_odd_h, "draw": m_odd_d, "away": m_odd_a},
+                    "match_context": match_context
+                }
+                for side in ("home", "away"):
+                    manual_payload[side]["absences"] = team_absence_payload.get(side, [])
+                    manual_payload[side]["recent_form"] = team_form_payload.get(side, [])
+                    manual_payload[side]["squad"] = team_squad_payload.get(side, [])
+                manual_payload = apply_attribute_ratings(
+                    manual_payload,
+                    team_rating_payload.get("home"), team_rating_payload.get("away"),
+                    team_squad_payload.get("home", []), team_squad_payload.get("away", [])
+                )
+                valid_obj, errs = validate_match_payload(manual_payload)
+                if errs:
+                    st.error("❌ Missing or invalid required fields:")
+                    for e in errs:
+                        st.write(f"- {e}")
+                else:
+                    execute_and_save_model(valid_obj, "Manual V6 Builder", neutral_venue, home_adv_val, dixon_coles_rho, elo_blend, uncertainty_val, simulation_count=simulation_count)
+                    st.success(f"✅ Simulation complete: **{valid_obj['home']['name']} vs {valid_obj['away']['name']}**. Open Prediction & Score Matrix for results.")
 
     # --- MODE C: SOFASCORE MATCH URL IMPORT ---
     elif input_mode == "SofaScore Match URL Import":
@@ -1227,6 +1355,14 @@ with tabs[1]:
         g4.metric("BTTS Yes", f"{res['p_btts']:.1%}")
 
         st.markdown(f"**Model Expected Goals (xG):** {h_name} **{res['exp_home']:.2f}** — **{res['exp_away']:.2f}** {a_name}")
+        ctx = data.get("match_context", {})
+        if ctx:
+            st.caption(f"Context: {ctx.get('competition') or 'Competition not supplied'} • Importance: {ctx.get('importance', 'Unknown')} • Rest days H/A: {ctx.get('home_rest_days', '—')}/{ctx.get('away_rest_days', '—')}")
+        for side, team_name in [("home", h_name), ("away", a_name)]:
+            squad = data.get(side, {}).get("squad", data.get(side, {}).get("player_ratings", []))
+            if squad:
+                starters = sum(1 for p in squad if str(p.get("role", "")).lower() == "starter")
+                st.caption(f"{team_name}: {len(squad)} squad entries recorded ({starters} marked as starters). Squad entries are contextual only in this model version.")
 
         st.markdown("### Most Likely Exact Scorelines")
         st.dataframe(res['scores'].style.format({'Probability': '{:.2%}'}), hide_index=True, use_container_width=True)
