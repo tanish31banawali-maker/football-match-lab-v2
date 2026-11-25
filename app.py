@@ -376,6 +376,49 @@ def apply_attribute_ratings(payload, home_ratings=None, away_ratings=None,
             payload[side]["player_ratings"] = players
     return payload
 
+
+def parse_pasted_rows(raw_text, columns, required_fields, allowed_values=None):
+    """Parse bulk-pasted pipe/tab/comma rows into validated dictionaries."""
+    rows, errors = [], []
+    for line_no, raw_line in enumerate((raw_text or "").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        delimiter = "|" if "|" in line else ("\t" if "\t" in line else ",")
+        parts = [part.strip() for part in line.split(delimiter)]
+        if parts and parts[0].strip().lower() in {"player", "name"}:
+            continue  # allow a pasted column-heading row
+        if len(parts) == 1 and len(columns) > 1:
+            errors.append(f"Line {line_no}: use '|' between fields.")
+            continue
+        parts += [""] * (len(columns) - len(parts))
+        item = dict(zip(columns, parts[:len(columns)]))
+        if not all(item.get(field) for field in required_fields):
+            errors.append(f"Line {line_no}: missing required field(s): {', '.join(f for f in required_fields if not item.get(f))}.")
+            continue
+        bad = False
+        for field, choices in (allowed_values or {}).items():
+            if item.get(field) and item[field].upper() not in choices:
+                errors.append(f"Line {line_no}: {field} must be one of {', '.join(choices)}.")
+                bad = True
+        for field in ("rating_0_100", "fitness_0_100"):
+            if item.get(field):
+                try:
+                    value = float(item[field])
+                    if not 0 <= value <= 100:
+                        raise ValueError
+                    item[field] = int(value) if value.is_integer() else value
+                except ValueError:
+                    errors.append(f"Line {line_no}: {field} must be between 0 and 100.")
+                    bad = True
+            else:
+                item[field] = None
+        if not bad:
+            item["position"] = item.get("position", "").upper()
+            item["role"] = item.get("role", "").title()
+            rows.append(item)
+    return rows, errors
+
 # ---------------- Strict Validation & Parsers (No Silent Defaults) ----------------
 def validate_match_payload(data):
     """Strictly validates a match payload; never substitutes silent defaults."""
@@ -1007,28 +1050,48 @@ with tabs[0]:
                     tactics = {"formation": formation, "style": style, "pressing": press, "defensive_line": line, "set_piece": set_piece, "transition": transition}
 
                 with st.expander(f"{label}: Starting XI & substitutes", expanded=False):
-                    st.caption("Add the expected XI and bench. Ratings are user-entered context only; the model will not invent a player rating or apply an unsupported numerical impact.")
-                    squad_df = st.data_editor(
-                        pd.DataFrame(columns=["player", "position", "role", "rating_0_100", "fitness_0_100"]),
-                        column_config={
-                            "position": st.column_config.SelectboxColumn("Position", options=["GK", "CB", "LB", "RB", "DEF", "DM", "CM", "AM", "LM", "RM", "MID", "LW", "RW", "ST", "FWD"]),
-                            "role": st.column_config.SelectboxColumn("Role", options=["Starter", "Substitute", "Doubtful"]),
-                            "rating_0_100": st.column_config.NumberColumn("Rating (0–100)", min_value=0, max_value=100, step=1),
-                            "fitness_0_100": st.column_config.NumberColumn("Fitness (0–100)", min_value=0, max_value=100, step=1)
-                        }, num_rows="dynamic", key=f"v6_{side}_squad", use_container_width=True
+                    st.caption("Paste the whole lineup in one go. One player per line; use | between columns. You can paste directly from a text lineup and quickly add positions/roles. Ratings and fitness are optional.")
+                    st.code("Player | Position | Role | Rating | Fitness\nGoalkeeper Name | GK | Starter | |\nDefender Name | CB | Starter | |\nMidfielder Name | CM | Starter | |\nForward Name | ST | Starter | |\nSubstitute Name | FWD | Substitute | |", language="text")
+                    squad_text = st.text_area(
+                        f"{label} full squad — paste lineup here",
+                        placeholder="Paste 11 starters and substitutes here...",
+                        height=220, key=f"v6_{side}_squad_bulk"
                     )
-                    team_squad_payload[side] = squad_df.dropna(subset=["player"]).to_dict(orient="records")
+                    squad_rows, squad_errors = parse_pasted_rows(
+                        squad_text,
+                        ["player", "position", "role", "rating_0_100", "fitness_0_100"],
+                        ["player", "position", "role"],
+                        {"position": ["GK", "CB", "LB", "RB", "DEF", "DM", "CM", "AM", "LM", "RM", "MID", "LW", "RW", "ST", "FWD"],
+                         "role": ["STARTER", "SUBSTITUTE", "DOUBTFUL"]}
+                    )
+                    if squad_errors:
+                        for error in squad_errors:
+                            st.warning(error)
+                    team_squad_payload[side] = squad_rows
+                    if squad_rows:
+                        st.success(f"Loaded {sum(r['role'] == 'Starter' for r in squad_rows)} starters and {sum(r['role'] == 'Substitute' for r in squad_rows)} substitutes.")
+                        st.dataframe(pd.DataFrame(squad_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No players entered yet. You can leave this section empty.")
 
                 with st.expander(f"{label}: Injuries & suspensions", expanded=False):
-                    abs_df = st.data_editor(
-                        pd.DataFrame(columns=["player", "position", "importance", "status"]),
-                        column_config={
-                            "position": st.column_config.SelectboxColumn("Position", options=["FWD", "MID", "DEF", "GK"], required=True),
-                            "importance": st.column_config.SelectboxColumn("Importance", options=["star", "starter", "rotation"], required=True),
-                            "status": st.column_config.SelectboxColumn("Status", options=["injured", "suspended", "doubtful", "unknown", "available"], required=True)
-                        }, num_rows="dynamic", key=f"v6_{side}_absences", use_container_width=True
+                    st.caption("Paste all unavailable players together. One per line: Player | Position | Importance | Status")
+                    st.code("Player | Position | Importance | Status\nPlayer Name | DEF | starter | injured\nPlayer Name | FWD | star | suspended", language="text")
+                    absence_text = st.text_area(f"{label} unavailable players", height=110, key=f"v6_{side}_absences_bulk")
+                    absence_rows, absence_errors = parse_pasted_rows(
+                        absence_text, ["player", "position", "importance", "status"],
+                        ["player", "position", "importance", "status"],
+                        {"position": ["FWD", "MID", "DEF", "GK"],
+                         "importance": ["STAR", "STARTER", "ROTATION"],
+                         "status": ["INJURED", "SUSPENDED", "DOUBTFUL", "UNKNOWN", "AVAILABLE"]}
                     )
-                    team_absence_payload[side] = abs_df.dropna(subset=["player"]).to_dict(orient="records")
+                    if absence_errors:
+                        for error in absence_errors:
+                            st.warning(error)
+                    team_absence_payload[side] = [{**r, "importance": r["importance"].lower(), "status": r["status"].lower()} for r in absence_rows]
+                    if absence_rows:
+                        st.success(f"Loaded {len(absence_rows)} unavailable-player entries.")
+                        st.dataframe(pd.DataFrame(team_absence_payload[side]), use_container_width=True, hide_index=True)
 
                 team_rating_payload[side] = render_team_attribute_ratings(f"V6 {label}")
                 team_payload[side] = {
