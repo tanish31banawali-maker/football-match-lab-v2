@@ -377,6 +377,49 @@ def apply_attribute_ratings(payload, home_ratings=None, away_ratings=None,
     return payload
 
 
+def parse_recent_match_rows(raw_text):
+    """Parse a bulk-pasted recent-match log; optional stats remain None."""
+    columns = ["date", "opponent", "venue", "gf", "ga", "xg", "xga", "opponent_elo"]
+    rows, errors = [], []
+    for line_no, raw_line in enumerate((raw_text or "").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        delimiter = "|" if "|" in line else ("\t" if "\t" in line else ",")
+        parts = [part.strip() for part in line.split(delimiter)]
+        if parts and parts[0].lower() in {"date", "match date"}:
+            continue
+        if len(parts) < 5:
+            errors.append(f"Line {line_no}: enter Date | Opponent | Venue | GF | GA (optional: xG | xGA | Opponent Elo).")
+            continue
+        parts += [""] * (len(columns) - len(parts))
+        item = dict(zip(columns, parts[:len(columns)]))
+        if not item["opponent"] or not item["venue"] or not item["gf"] or not item["ga"]:
+            errors.append(f"Line {line_no}: opponent, venue, GF and GA are required.")
+            continue
+        if item["venue"].title() not in {"Home", "Away", "Neutral"}:
+            errors.append(f"Line {line_no}: venue must be Home, Away or Neutral.")
+            continue
+        bad = False
+        for field in ("gf", "ga", "xg", "xga", "opponent_elo"):
+            raw_value = item[field]
+            if not raw_value:
+                item[field] = None
+                continue
+            try:
+                value = float(raw_value)
+                upper = 2600 if field == "opponent_elo" else 20
+                if value < 0 or value > upper or (field in {"gf", "ga"} and not value.is_integer()):
+                    raise ValueError
+                item[field] = int(value) if value.is_integer() else value
+            except ValueError:
+                errors.append(f"Line {line_no}: {field.upper()} has an invalid value.")
+                bad = True
+        item["venue"] = item["venue"].title()
+        if not bad:
+            rows.append(item)
+    return rows, errors
+
 def parse_pasted_rows(raw_text, columns, required_fields, allowed_values=None):
     """Parse bulk-pasted pipe/tab/comma rows into validated dictionaries."""
     rows, errors = [], []
@@ -1028,15 +1071,22 @@ with tabs[0]:
                         optional_stats[key] = stat_cols[i % 4].number_input(f"{label} {title}", min_value=0.0, max_value=maximum, value=None, step=0.1, key=f"v6_{side}_{key}")
 
                 with st.expander(f"{label}: Recent match log", expanded=False):
-                    st.caption("Enter recent matches if you have them. Keep the sample consistent and include opponent strength where possible.")
-                    form_df = st.data_editor(
-                        pd.DataFrame(columns=["date", "opponent", "venue", "gf", "ga", "xg", "xga", "opponent_elo"]),
-                        column_config={
-                            "venue": st.column_config.SelectboxColumn("Venue", options=["Home", "Away", "Neutral"]),
-                            **{k: st.column_config.NumberColumn(k.upper() if k in ["gf", "ga", "xg", "xga"] else k.replace("_", " ").title(), min_value=0.0, max_value=2600.0, step=0.1) for k in ["gf", "ga", "xg", "xga", "opponent_elo"]}
-                        }, num_rows="dynamic", key=f"v6_{side}_form", use_container_width=True
+                    st.caption("Paste all recent results together — no spreadsheet rows. One match per line. Required: date, opponent, venue, goals for and goals against. xG, xGA and opponent Elo are optional.")
+                    st.code("Date | Opponent | Venue | GF | GA | xG | xGA | Opponent Elo\n2026-11-20 | Arsenal | Away | 1 | 2 | 0.85 | 1.60 | 1900\n2026-11-08 | Burnley | Home | 3 | 0 | 2.10 | 0.45 | 1500", language="text")
+                    recent_text = st.text_area(
+                        f"{label} recent matches — paste here",
+                        placeholder="Paste 5–10 recent matches, one per line...",
+                        height=180, key=f"v6_{side}_form_bulk"
                     )
-                    team_form_payload[side] = form_df.where(pd.notna(form_df), None).to_dict(orient="records")
+                    form_rows, form_errors = parse_recent_match_rows(recent_text)
+                    for error in form_errors:
+                        st.warning(error)
+                    team_form_payload[side] = form_rows
+                    if form_rows:
+                        st.success(f"Loaded {len(form_rows)} recent matches.")
+                        st.dataframe(pd.DataFrame(form_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No recent matches entered. This section can be left blank.")
 
                 with st.expander(f"{label}: Tactics & formation", expanded=False):
                     t1, t2, t3 = st.columns(3)
