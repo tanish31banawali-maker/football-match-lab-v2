@@ -1283,8 +1283,7 @@ def execute_and_save_model(payload, source_mode, neutral_venue, home_adv, rho, e
 
 # ---------------- Sidebar Controls ----------------
 with st.sidebar:
-    st.image("[https://img.icons8.com/color/96/football-ball-1.png](https://img.icons8.com/color/96/football-ball-1.png)", width=64)
-    st.title("Match Lab V6.2")
+    st.markdown("## ⚽ Match Lab V6.2")
 
     api_key_input = st.text_input("API-Football Key (For Live API Mode)", type="password", value=get_api_key())
     st.session_state['api_key'] = api_key_input
@@ -1867,9 +1866,9 @@ with tabs[1]:
         m3.metric(f"✈️ {a_name} Win (2)", f"{res['p_away']:.1%}")
 
         dc1, dc2, dc3 = st.columns(3)
-        dc1.metric(f"Double Chance 1X", f"{res['p_1x']:.1%}")
-        dc2.metric(f"Double Chance X2", f"{res['p_x2']:.1%}")
-        dc3.metric(f"Double Chance 12", f"{res['p_12']:.1%}")
+        dc1.metric("Double Chance 1X", f"{res['p_1x']:.1%}")
+        dc2.metric("Double Chance X2", f"{res['p_x2']:.1%}")
+        dc3.metric("Double Chance 12", f"{res['p_12']:.1%}")
 
         g1, g2, g3, g4, g5 = st.columns(5)
         g1.metric("Over 1.5", f"{res['p_over15']:.1%}")
